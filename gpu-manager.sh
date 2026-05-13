@@ -841,11 +841,23 @@ check_unsigned_modules() {
 
     # 检查 Secure Boot 状态
     if ! check_secure_boot; then
-        success "Secure Boot 未开启，无需检查模块签名"
-        return 0
+        warn "Secure Boot 当前未开启"
+        echo ""
+        info "你可以在 Secure Boot 关闭的状态下提前完成签名准备，"
+        info "这样开启 Secure Boot 后系统即可正常启动。"
+        echo ""
+        echo "  a. 继续扫描并修复（推荐：提前签名）"
+        echo "  b. 跳过（当前无需签名）"
+        echo ""
+        read -p "  请选择 (a/b): " sb_choice
+        if [ "$sb_choice" != "a" ]; then
+            warn "已跳过"
+            return 0
+        fi
+        echo ""
     fi
 
-    info "Secure Boot 已开启，正在扫描第三方内核模块..."
+    info "正在扫描第三方内核模块..."
     echo ""
 
     local KVER=$(uname -r)
