@@ -276,15 +276,27 @@ setup_dkms_auto_sign() {
 SIGNEOF
     chmod +x "$SIGN_HOOK"
 
-    # 配置 DKMS 使用签名脚本
+    # 配置 DKMS framework.conf
+    # sign_tool: DKMS 原生自动签名
+    # mok_signing_key / mok_certificate: ubuntu-drivers 使用的签名路径
+    #   配置后 ubuntu-drivers autoinstall 不会再触发额外的 mokutil --import
     if [ -f "$DKMS_CONF" ]; then
         if ! grep -q "sign_tool" "$DKMS_CONF"; then
             echo "" >> "$DKMS_CONF"
             echo "# GPU Manager: auto-sign for Secure Boot" >> "$DKMS_CONF"
             echo "sign_tool=\"$SIGN_HOOK\"" >> "$DKMS_CONF"
         fi
+        if ! grep -q "mok_signing_key" "$DKMS_CONF"; then
+            echo "mok_signing_key=$MOK_PRIV" >> "$DKMS_CONF"
+            echo "mok_certificate=$MOK_DER" >> "$DKMS_CONF"
+        fi
     else
-        echo "sign_tool=\"$SIGN_HOOK\"" > "$DKMS_CONF"
+        cat > "$DKMS_CONF" << CONFEOF
+# GPU Manager: auto-sign for Secure Boot
+sign_tool="$SIGN_HOOK"
+mok_signing_key=$MOK_PRIV
+mok_certificate=$MOK_DER
+CONFEOF
     fi
 
     success "已配置 DKMS 自动签名（内核更新时自动生效）"
@@ -330,6 +342,10 @@ install_nvidia_driver() {
             fi
         else
             NEED_MOK=1
+            # 提前配置 DKMS 自动签名，这样 ubuntu-drivers autoinstall
+            # 在 DKMS 编译模块时就会直接用 MOK 密钥签名，
+            # 避免 ubuntu-drivers 自己触发 mokutil --import 再次要求输入密码
+            setup_dkms_auto_sign
         fi
     elif [ -d /sys/firmware/efi ]; then
         # Ubuntu 24.04+：系统自带 DKMS 签名，无需手动处理
@@ -855,157 +871,116 @@ tpm_status() {
 }
 
 # ============================================================
-# 未签名内核模块检查与修复 (Secure Boot)
+# Secure Boot 诊断与修复（一键流程）
 # ============================================================
 
-# Secure Boot 引导链修复（shim + grub + MOK 证书）
-repair_secure_boot_chain() {
+secure_boot_manager() {
     echo -e "\e[36m"
     echo "=================================================="
-    echo "   Secure Boot 引导链修复 (Boot Chain Repair)"
+    echo "     Secure Boot 诊断与修复 (Secure Boot Manager)"
     echo "=================================================="
     echo -e "\e[0m"
 
-    echo ""
-    info "本功能修复 UEFI 安全启动引导链（shim → GRUB → 内核）"
-    info "适用于出现以下报错的情况："
-    warn "  - error: shim_lock protocol not found"
-    warn "  - error: you need to load the kernel first"
+    # ===== Step 1: 环境检测 =====
+    info "[1/5] 环境检测..."
     echo ""
 
-    # Step 1: 检查 UEFI 模式
-    info "[1/5] 检查启动模式..."
+    # UEFI 检查
     if [ ! -d /sys/firmware/efi ]; then
-        error "当前系统不是 UEFI 模式，本修复仅适用于 UEFI 系统"
+        error "当前系统不是 UEFI 模式，Secure Boot 功能不适用"
         return 1
     fi
-    success "UEFI 模式 ✓"
+    success "  UEFI 模式 ✓"
 
-    # 检查 EFI 分区
-    if ! mountpoint -q /boot/efi 2>/dev/null; then
-        error "EFI 分区未挂载在 /boot/efi"
-        error "请先确认 EFI 分区存在并挂载: mount /dev/nvmeXnXpX /boot/efi"
-        return 1
-    fi
-    success "EFI 分区已挂载: $(df -h /boot/efi | tail -1 | awk '{print $1, $2}')"
-    echo ""
-
-    confirm_action "是否开始修复 Secure Boot 引导链"
-    if [ $? -ne 0 ]; then
-        return 0
-    fi
-
-    echo ""
-
-    # Step 2: 重装安全启动依赖包
-    info "[2/5] 重装安全启动依赖包..."
-    apt_with_progress "更新软件源" update -qq
-    if [ $? -ne 0 ]; then
-        error "软件源更新失败"
-        return 1
-    fi
-
-    run_with_timeout 180 "安装 shim-signed + grub-efi + mokutil" \
-        apt-get install --reinstall -y shim-signed grub-efi-amd64 mokutil
-    if [ $? -ne 0 ]; then
-        error "依赖包安装失败"
-        return 1
-    fi
-    success "依赖包安装完成"
-    echo ""
-
-    # Step 3: 重装 UEFI GRUB
-    info "[3/5] 重装 UEFI 安全启动版 GRUB..."
-    grub-install --target=x86_64-efi --bootloader-id=ubuntu --efi-directory=/boot/efi --recheck 2>&1
-    if [ $? -ne 0 ]; then
-        error "GRUB 安装失败"
-        return 1
-    fi
-    success "GRUB 安装完成"
-
-    info "更新 GRUB 配置..."
-    update-grub 2>&1
-    if [ $? -ne 0 ]; then
-        error "GRUB 配置更新失败"
-        return 1
-    fi
-    success "GRUB 配置更新完成"
-    echo ""
-
-    # Step 4: 导入 Ubuntu 官方 MOK 证书
-    info "[4/5] 导入 Ubuntu 官方安全启动密钥..."
-
-    local SHIM_MOK="/usr/share/shim-signed/mok.crt"
-    if [ ! -f "$SHIM_MOK" ]; then
-        # 备用路径
-        SHIM_MOK=$(find /usr/share/shim-signed/ -name "*.crt" 2>/dev/null | head -1)
-    fi
-
-    if [ -z "$SHIM_MOK" ] || [ ! -f "$SHIM_MOK" ]; then
-        warn "未找到 shim 官方 MOK 证书文件"
-        warn "跳过证书导入（如已有证书可忽略）"
+    # Secure Boot 状态
+    local SB_ON=0
+    if check_secure_boot; then
+        SB_ON=1
+        success "  Secure Boot: 已开启"
     else
-        echo ""
-        warn "接下来需要设置一个临时密码（重启时在蓝色界面输入）"
-        echo ""
-        mokutil --import "$SHIM_MOK"
-        if [ $? -eq 0 ]; then
-            success "MOK 证书已提交注册请求"
-        else
-            warn "MOK 证书导入失败（如已注册可忽略）"
-        fi
-    fi
-
-    echo ""
-
-    # Step 5: 提示重启
-    info "[5/5] 修复完成"
-    echo ""
-    success "╔══════════════════════════════════════════════════════════╗"
-    success "║  Secure Boot 引导链修复完成！                            ║"
-    success "╚══════════════════════════════════════════════════════════╝"
-    echo ""
-    warn "重启后操作："
-    warn "  1) 如果出现蓝色 MOK Manager 界面："
-    warn "     Enroll MOK → Continue → Yes → 输入刚才的密码 → Reboot"
-    warn "  2) 进入系统后验证: mokutil --sb-state"
-    warn "     应显示: SecureBoot enabled"
-    echo ""
-
-    read -p "是否立即重启？(yes/no): " reboot_confirm
-    if [ "$reboot_confirm" = "yes" ]; then
-        reboot
-    else
-        warn "请稍后手动执行: sudo reboot"
-    fi
-}
-
-check_unsigned_modules() {
-    echo -e "\e[36m"
-    echo "=================================================="
-    echo "     未签名内核模块检查 (Secure Boot Audit)"
-    echo "=================================================="
-    echo -e "\e[0m"
-
-    # 检查 Secure Boot 状态
-    if ! check_secure_boot; then
-        warn "Secure Boot 当前未开启"
+        warn "  Secure Boot: 未开启"
         echo ""
         info "你可以在 Secure Boot 关闭的状态下提前完成签名准备，"
         info "这样开启 Secure Boot 后系统即可正常启动。"
         echo ""
-        echo "  a. 继续扫描并修复（推荐：提前签名）"
-        echo "  b. 跳过（当前无需签名）"
+        echo "  a. 继续诊断并修复（推荐：提前准备）"
+        echo "  b. 退出"
         echo ""
         read -p "  请选择 (a/b): " sb_choice
         if [ "$sb_choice" != "a" ]; then
-            warn "已跳过"
             return 0
         fi
-        echo ""
     fi
 
-    info "正在扫描第三方内核模块..."
+    # EFI 分区
+    if mountpoint -q /boot/efi 2>/dev/null; then
+        success "  EFI 分区: $(df -h /boot/efi | tail -1 | awk '{print $1, $2}')"
+    else
+        warn "  EFI 分区: 未挂载在 /boot/efi"
+    fi
+
+    # Ubuntu 版本
+    local UBUNTU_VER=""
+    if [ -f /etc/os-release ]; then
+        UBUNTU_VER=$(. /etc/os-release && echo "${VERSION_ID}")
+    fi
+
+    if [ -n "$UBUNTU_VER" ] && [ "$(echo "$UBUNTU_VER >= 24.04" | bc 2>/dev/null)" = "1" ]; then
+        echo ""
+        success "  Ubuntu $UBUNTU_VER 已内置 DKMS 自动签名"
+        info "  系统原生支持 Secure Boot，通常无需手动干预"
+        echo ""
+        echo "  是否仍要继续诊断？（可能无需操作）"
+        echo "  a. 继续"
+        echo "  b. 退出"
+        echo ""
+        read -p "  请选择 (a/b): " ver_choice
+        if [ "$ver_choice" != "a" ]; then
+            return 0
+        fi
+    fi
+
+    echo ""
+
+    # ===== Step 2: MOK 密钥状态 =====
+    info "[2/5] MOK 密钥状态..."
+    echo ""
+
+    local MOK_READY=0
+    if [ -f "$MOK_PRIV" ] && [ -f "$MOK_DER" ]; then
+        success "  密钥文件: 已存在"
+
+        # 证书摘要
+        local MOK_CN=$(openssl x509 -in "$MOK_DER" -inform DER -noout -subject 2>/dev/null | sed 's/.*CN = //' | sed 's/.*CN=//')
+        local MOK_EXP=$(openssl x509 -in "$MOK_DER" -inform DER -noout -enddate 2>/dev/null | sed 's/notAfter=//')
+        echo "    CN: $MOK_CN"
+        echo "    有效期至: $MOK_EXP"
+
+        # 注册状态
+        if command -v mokutil &>/dev/null; then
+            local MOK_TEST=$(mokutil --test-key "$MOK_DER" 2>/dev/null)
+            if echo "$MOK_TEST" | grep -qi "already enrolled"; then
+                success "  UEFI 注册: ✓ 已注册（生效中）"
+                MOK_READY=1
+            else
+                warn "  UEFI 注册: ✗ 未注册（需重启确认）"
+            fi
+        fi
+
+        # DKMS 自动签名
+        if [ -f /etc/dkms/framework.conf ] && grep -q "sign_tool" /etc/dkms/framework.conf 2>/dev/null; then
+            success "  DKMS 自动签名: ✓ 已配置"
+        else
+            warn "  DKMS 自动签名: ✗ 未配置"
+        fi
+    else
+        warn "  密钥文件: 未生成"
+    fi
+
+    echo ""
+
+    # ===== Step 3: 扫描未签名模块 =====
+    info "[3/5] 扫描第三方内核模块..."
     echo ""
 
     local KVER=$(uname -r)
@@ -1014,10 +989,9 @@ check_unsigned_modules() {
     local SIGNED_LIST=()
     local INDEX=0
 
-    # 获取所有 DKMS 模块 + 非官方模块
+    # 获取所有第三方模块
     local THIRD_PARTY_MODS=""
 
-    # 方法1: DKMS 安装的模块
     if command -v dkms &>/dev/null; then
         local DKMS_MODS=$(dkms status 2>/dev/null | awk -F',' '{print $1}' | awk -F'/' '{print $1}' | sort -u)
         if [ -n "$DKMS_MODS" ]; then
@@ -1029,199 +1003,313 @@ check_unsigned_modules() {
         fi
     fi
 
-    # 方法2: updates/dkms 目录下的所有模块（通用）
     local DKMS_DIR_MODS=$(find "$MOD_DIR/updates/dkms" "$MOD_DIR/extra" -name "*.ko" -o -name "*.ko.zst" -o -name "*.ko.xz" 2>/dev/null)
     THIRD_PARTY_MODS="$THIRD_PARTY_MODS $DKMS_DIR_MODS"
 
-    # 方法3: 常见第三方模块名直接搜索
     for NAME in nvidia vboxdrv vboxnetflt vboxnetadp zfs wireguard rtl; do
         local FOUND=$(find "$MOD_DIR" -name "${NAME}*.ko" -o -name "${NAME}*.ko.zst" -o -name "${NAME}*.ko.xz" 2>/dev/null)
         THIRD_PARTY_MODS="$THIRD_PARTY_MODS $FOUND"
     done
 
-    # 去重
     THIRD_PARTY_MODS=$(echo "$THIRD_PARTY_MODS" | tr ' ' '\n' | sort -u | grep -v '^$')
 
     if [ -z "$THIRD_PARTY_MODS" ]; then
-        success "未发现第三方内核模块"
-        return 0
-    fi
+        success "  未发现第三方内核模块"
+        echo ""
+    else
+        printf "  %-4s %-40s %s\n" "编号" "模块" "签名状态"
+        echo "  ──── ──────────────────────────────────────── ──────────"
 
-    # 检查每个模块的签名状态
-    info "扫描结果："
-    echo ""
-    printf "  %-4s %-40s %s\n" "编号" "模块" "签名状态"
-    echo "  ──── ──────────────────────────────────────── ──────────"
+        while read -r MOD_PATH; do
+            [ -z "$MOD_PATH" ] && continue
+            local MOD_NAME=$(basename "$MOD_PATH" | sed 's/\.ko\(\.zst\|\.xz\)\?$//')
+            local IS_SIGNED=0
 
-    while read -r MOD_PATH; do
-        [ -z "$MOD_PATH" ] && continue
-        local MOD_NAME=$(basename "$MOD_PATH" | sed 's/\.ko\(\.zst\|\.xz\)\?$//')
-        local IS_SIGNED=0
-
-        # 检查签名方法1: modinfo
-        if modinfo "$MOD_PATH" 2>/dev/null | grep -q "sig_id\|signature"; then
-            IS_SIGNED=1
-        fi
-
-        # 检查签名方法2: 文件尾部有签名标记
-        if [ $IS_SIGNED -eq 0 ] && [ -f "$MOD_PATH" ]; then
-            if tail -c 28 "$MOD_PATH" 2>/dev/null | grep -q "Module signature"; then
+            if modinfo "$MOD_PATH" 2>/dev/null | grep -q "sig_id\|signature"; then
                 IS_SIGNED=1
             fi
-        fi
 
-        INDEX=$((INDEX + 1))
+            if [ $IS_SIGNED -eq 0 ] && [ -f "$MOD_PATH" ]; then
+                if tail -c 28 "$MOD_PATH" 2>/dev/null | grep -q "Module signature"; then
+                    IS_SIGNED=1
+                fi
+            fi
 
-        if [ $IS_SIGNED -eq 1 ]; then
-            SIGNED_LIST+=("$MOD_PATH")
-            printf "  %-4s %-40s \e[32m✓ 已签名\e[0m\n" "$INDEX" "$MOD_NAME"
-        else
-            UNSIGNED_LIST+=("$MOD_PATH")
-            printf "  %-4s %-40s \e[31m✗ 未签名\e[0m\n" "$INDEX" "$MOD_NAME"
-        fi
-    done <<< "$THIRD_PARTY_MODS"
+            INDEX=$((INDEX + 1))
+
+            if [ $IS_SIGNED -eq 1 ]; then
+                SIGNED_LIST+=("$MOD_PATH")
+                printf "  %-4s %-40s \e[32m✓ 已签名\e[0m\n" "$INDEX" "$MOD_NAME"
+            else
+                UNSIGNED_LIST+=("$MOD_PATH")
+                printf "  %-4s %-40s \e[31m✗ 未签名\e[0m\n" "$INDEX" "$MOD_NAME"
+            fi
+        done <<< "$THIRD_PARTY_MODS"
+
+        echo ""
+        echo "  ──────────────────────────────────────────────────────"
+        echo -e "  已签名: \e[32m${#SIGNED_LIST[@]}\e[0m  |  未签名: \e[31m${#UNSIGNED_LIST[@]}\e[0m  |  总计: $INDEX"
+    fi
 
     echo ""
-    echo "  ──────────────────────────────────────────────────────"
-    echo -e "  已签名: \e[32m${#SIGNED_LIST[@]}\e[0m  |  未签名: \e[31m${#UNSIGNED_LIST[@]}\e[0m  |  总计: $INDEX"
-    echo ""
 
-    # 无未签名模块
+    # ===== Step 4: 修复未签名模块 =====
     if [ ${#UNSIGNED_LIST[@]} -eq 0 ]; then
-        success "所有第三方模块均已签名，Secure Boot 兼容 ✓"
-        return 0
-    fi
+        success "[4/5] 所有模块已签名，无需修复 ✓"
+    else
+        info "[4/5] 修复未签名模块..."
+        echo ""
 
-    # 有未签名模块，提供修复选项
-    warn "以上未签名模块在 Secure Boot 下可能导致加载失败或无法启动"
-    echo ""
-
-    # 检查 MOK 密钥
-    if [ ! -f "$MOK_PRIV" ] || [ ! -f "$MOK_DER" ]; then
-        warn "尚未生成 MOK 签名密钥"
-        confirm_action "是否生成 MOK 密钥并修复未签名模块"
-        if [ $? -ne 0 ]; then
-            return 0
-        fi
-        setup_mok_key
-        if [ $? -ne 0 ]; then
-            error "MOK 密钥配置失败"
-            return 1
-        fi
-    fi
-
-    echo "  修复选项："
-    echo "  a. 修复全部未签名模块（推荐）"
-    echo "  s. 选择特定模块修复"
-    echo "  c. 取消"
-    echo ""
-    read -p "  请选择 (a/s/c): " fix_choice
-
-    case "$fix_choice" in
-        a)
-            info "正在签名所有未签名模块..."
-            local KVER=$(uname -r)
-            local SIGN_FILE="/usr/src/linux-headers-${KVER}/scripts/sign-file"
-            if [ ! -f "$SIGN_FILE" ]; then
-                SIGN_FILE=$(find /usr/src/ -name "sign-file" -type f 2>/dev/null | head -1)
-            fi
-            if [ -z "$SIGN_FILE" ] || [ ! -f "$SIGN_FILE" ]; then
-                error "未找到 sign-file 工具，请安装 linux-headers-$(uname -r)"
-                return 1
-            fi
-
-            local FIX_COUNT=0
-            local FAIL_COUNT=0
-            for MOD in "${UNSIGNED_LIST[@]}"; do
-                local MNAME=$(basename "$MOD" | sed 's/\.ko\(\.zst\|\.xz\)\?$//')
-                "$SIGN_FILE" sha256 "$MOK_PRIV" "$MOK_DER" "$MOD" 2>/dev/null
-                if [ $? -eq 0 ]; then
-                    FIX_COUNT=$((FIX_COUNT + 1))
-                    echo -e "  \e[32m✓\e[0m $MNAME"
-                else
-                    FAIL_COUNT=$((FAIL_COUNT + 1))
-                    echo -e "  \e[31m✗\e[0m $MNAME（签名失败）"
-                fi
-            done
-
+        # 确保 MOK 密钥存在
+        if [ ! -f "$MOK_PRIV" ] || [ ! -f "$MOK_DER" ]; then
+            info "  需要先生成 MOK 签名密钥..."
             echo ""
-            success "签名完成: $FIX_COUNT 成功, $FAIL_COUNT 失败"
-
-            setup_dkms_auto_sign
-
-            if mokutil --test-key "$MOK_DER" 2>/dev/null | grep -qi "not enrolled"; then
+            setup_mok_key
+            if [ $? -ne 0 ]; then
+                error "  MOK 密钥配置失败，无法签名模块"
                 echo ""
-                warn "MOK 密钥尚未注册到 UEFI 固件"
-                warn "重启时需要在蓝色 MOK Manager 界面完成注册："
-                warn "  Enroll MOK → Continue → Yes → 输入密码 → Reboot"
+                echo "  是否跳过签名，继续检查引导链？"
+                read -p "  (y/n): " skip_sign
+                if [ "$skip_sign" != "y" ]; then
+                    return 1
+                fi
             fi
-            ;;
+        fi
 
-        s)
-            echo ""
-            echo "  输入要修复的编号（逗号分隔，如: 1,3,5）："
-            read -p "  > " select_nums
-
-            local KVER=$(uname -r)
+        if [ -f "$MOK_PRIV" ] && [ -f "$MOK_DER" ]; then
+            # 查找 sign-file
             local SIGN_FILE="/usr/src/linux-headers-${KVER}/scripts/sign-file"
             if [ ! -f "$SIGN_FILE" ]; then
                 SIGN_FILE=$(find /usr/src/ -name "sign-file" -type f 2>/dev/null | head -1)
             fi
+
             if [ -z "$SIGN_FILE" ] || [ ! -f "$SIGN_FILE" ]; then
-                error "未找到 sign-file 工具"
-                return 1
+                error "  未找到 sign-file 工具"
+                warn "  请安装: sudo apt install linux-headers-$(uname -r)"
+            else
+                echo "  修复选项："
+                echo "    a. 修复全部未签名模块（推荐）"
+                echo "    s. 选择特定模块修复"
+                echo "    c. 跳过"
+                echo ""
+                read -p "  请选择 (a/s/c): " fix_choice
+
+                case "$fix_choice" in
+                    a)
+                        info "  正在签名所有未签名模块..."
+                        local FIX_COUNT=0
+                        local FAIL_COUNT=0
+                        for MOD in "${UNSIGNED_LIST[@]}"; do
+                            local MNAME=$(basename "$MOD" | sed 's/\.ko\(\.zst\|\.xz\)\?$//')
+                            "$SIGN_FILE" sha256 "$MOK_PRIV" "$MOK_DER" "$MOD" 2>/dev/null
+                            if [ $? -eq 0 ]; then
+                                FIX_COUNT=$((FIX_COUNT + 1))
+                                echo -e "    \e[32m✓\e[0m $MNAME"
+                            else
+                                FAIL_COUNT=$((FAIL_COUNT + 1))
+                                echo -e "    \e[31m✗\e[0m $MNAME（签名失败）"
+                            fi
+                        done
+                        echo ""
+                        success "  签名完成: $FIX_COUNT 成功, $FAIL_COUNT 失败"
+                        setup_dkms_auto_sign
+                        ;;
+                    s)
+                        echo ""
+                        echo "  输入要修复的编号（逗号分隔，如: 1,3,5）："
+                        read -p "  > " select_nums
+
+                        IFS=',' read -ra SELECTED <<< "$select_nums"
+                        local FIX_COUNT=0
+                        local ALL_INDEX=0
+
+                        while read -r MOD_PATH; do
+                            [ -z "$MOD_PATH" ] && continue
+                            ALL_INDEX=$((ALL_INDEX + 1))
+
+                            local IS_UNSIGNED=0
+                            for UM in "${UNSIGNED_LIST[@]}"; do
+                                if [ "$UM" = "$MOD_PATH" ]; then
+                                    IS_UNSIGNED=1
+                                    break
+                                fi
+                            done
+                            [ $IS_UNSIGNED -eq 0 ] && continue
+
+                            for SEL in "${SELECTED[@]}"; do
+                                SEL=$(echo "$SEL" | tr -d ' ')
+                                if [ "$SEL" = "$ALL_INDEX" ]; then
+                                    local MNAME=$(basename "$MOD_PATH" | sed 's/\.ko\(\.zst\|\.xz\)\?$//')
+                                    "$SIGN_FILE" sha256 "$MOK_PRIV" "$MOK_DER" "$MOD_PATH" 2>/dev/null
+                                    if [ $? -eq 0 ]; then
+                                        FIX_COUNT=$((FIX_COUNT + 1))
+                                        echo -e "    \e[32m✓\e[0m $MNAME"
+                                    else
+                                        echo -e "    \e[31m✗\e[0m $MNAME（签名失败）"
+                                    fi
+                                fi
+                            done
+                        done <<< "$THIRD_PARTY_MODS"
+
+                        echo ""
+                        success "  已签名 $FIX_COUNT 个模块"
+                        setup_dkms_auto_sign
+                        ;;
+                    *)
+                        warn "  已跳过模块签名"
+                        ;;
+                esac
             fi
+        fi
+    fi
 
-            # 重建编号 → 文件映射（只取未签名的）
-            local UI=0
-            IFS=',' read -ra SELECTED <<< "$select_nums"
-            local FIX_COUNT=0
+    echo ""
 
-            # 需要按原始 INDEX 映射，重新遍历
-            local ALL_INDEX=0
-            local UNSIGNED_INDEX=0
-            while read -r MOD_PATH; do
-                [ -z "$MOD_PATH" ] && continue
-                ALL_INDEX=$((ALL_INDEX + 1))
+    # ===== Step 5: 引导链检查 =====
+    info "[5/5] 引导链检查..."
+    echo ""
 
-                # 判断是否在未签名列表中
-                local IS_UNSIGNED=0
-                for UM in "${UNSIGNED_LIST[@]}"; do
-                    if [ "$UM" = "$MOD_PATH" ]; then
-                        IS_UNSIGNED=1
-                        break
-                    fi
-                done
+    local BOOT_ISSUES=0
 
-                if [ $IS_UNSIGNED -eq 0 ]; then
-                    continue
+    # 检查 shim
+    if dpkg -l shim-signed 2>/dev/null | grep -q "^ii"; then
+        success "  shim-signed: ✓ 已安装"
+    else
+        warn "  shim-signed: ✗ 未安装"
+        BOOT_ISSUES=$((BOOT_ISSUES + 1))
+    fi
+
+    # 检查 grub-efi
+    if dpkg -l grub-efi-amd64-signed 2>/dev/null | grep -q "^ii"; then
+        success "  grub-efi-amd64-signed: ✓ 已安装"
+    else
+        warn "  grub-efi-amd64-signed: ✗ 未安装"
+        BOOT_ISSUES=$((BOOT_ISSUES + 1))
+    fi
+
+    # 检查 EFI 文件
+    if [ -f /boot/efi/EFI/ubuntu/shimx64.efi ]; then
+        success "  shimx64.efi: ✓ 存在"
+    else
+        warn "  shimx64.efi: ✗ 缺失"
+        BOOT_ISSUES=$((BOOT_ISSUES + 1))
+    fi
+
+    if [ -f /boot/efi/EFI/ubuntu/grubx64.efi ]; then
+        success "  grubx64.efi: ✓ 存在"
+    else
+        warn "  grubx64.efi: ✗ 缺失"
+        BOOT_ISSUES=$((BOOT_ISSUES + 1))
+    fi
+
+    echo ""
+
+    if [ $BOOT_ISSUES -gt 0 ]; then
+        warn "检测到 $BOOT_ISSUES 个引导链问题"
+        echo ""
+        echo "  是否修复引导链？（重装 shim + grub + 导入 MOK 证书）"
+        echo "  适用于出现 'shim_lock protocol not found' 等报错"
+        echo ""
+        read -p "  修复引导链？(y/n): " fix_boot
+
+        if [ "$fix_boot" = "y" ]; then
+            echo ""
+            info "  修复引导链..."
+
+            apt_with_progress "更新软件源" update -qq
+            run_with_timeout 180 "重装 shim-signed + grub-efi + mokutil" \
+                apt-get install --reinstall -y shim-signed grub-efi-amd64 mokutil
+
+            if [ $? -ne 0 ]; then
+                error "  依赖包安装失败"
+            else
+                success "  依赖包重装完成"
+
+                grub-install --target=x86_64-efi --bootloader-id=ubuntu --efi-directory=/boot/efi --recheck 2>&1
+                if [ $? -eq 0 ]; then
+                    success "  GRUB 重装完成"
+                    update-grub 2>&1
+                    success "  GRUB 配置更新完成"
+                else
+                    error "  GRUB 安装失败"
                 fi
 
-                # 检查此编号是否被选中
-                for SEL in "${SELECTED[@]}"; do
-                    SEL=$(echo "$SEL" | tr -d ' ')
-                    if [ "$SEL" = "$ALL_INDEX" ]; then
-                        local MNAME=$(basename "$MOD_PATH" | sed 's/\.ko\(\.zst\|\.xz\)\?$//')
-                        "$SIGN_FILE" sha256 "$MOK_PRIV" "$MOK_DER" "$MOD_PATH" 2>/dev/null
-                        if [ $? -eq 0 ]; then
-                            FIX_COUNT=$((FIX_COUNT + 1))
-                            echo -e "  \e[32m✓\e[0m $MNAME"
-                        else
-                            echo -e "  \e[31m✗\e[0m $MNAME（签名失败）"
-                        fi
+                # 导入 shim MOK 证书
+                local SHIM_MOK="/usr/share/shim-signed/mok.crt"
+                if [ ! -f "$SHIM_MOK" ]; then
+                    SHIM_MOK=$(find /usr/share/shim-signed/ -name "*.crt" 2>/dev/null | head -1)
+                fi
+                if [ -n "$SHIM_MOK" ] && [ -f "$SHIM_MOK" ]; then
+                    echo ""
+                    warn "  需要设置一个临时密码（重启时在蓝色 MOK Manager 界面输入）"
+                    echo ""
+                    mokutil --import "$SHIM_MOK"
+                    if [ $? -eq 0 ]; then
+                        success "  MOK 证书已提交注册请求"
                     fi
-                done
-            done <<< "$THIRD_PARTY_MODS"
+                fi
+            fi
+        fi
+    else
+        success "  引导链完整，无需修复 ✓"
+    fi
 
-            echo ""
-            success "已签名 $FIX_COUNT 个模块"
-            setup_dkms_auto_sign
-            ;;
+    # ===== 汇总 =====
+    echo ""
+    echo "══════════════════════════════════════════════════════"
+    echo -e "  \e[36m诊断汇总\e[0m"
+    echo "══════════════════════════════════════════════════════"
+    echo ""
 
-        *)
-            warn "已取消"
-            ;;
-    esac
+    if [ $SB_ON -eq 1 ]; then
+        echo -e "  Secure Boot:     \e[32m已开启\e[0m"
+    else
+        echo -e "  Secure Boot:     \e[33m未开启\e[0m"
+    fi
+
+    if [ -f "$MOK_DER" ]; then
+        if command -v mokutil &>/dev/null && mokutil --test-key "$MOK_DER" 2>/dev/null | grep -qi "already enrolled"; then
+            echo -e "  MOK 密钥:        \e[32m已注册\e[0m"
+        else
+            echo -e "  MOK 密钥:        \e[33m待重启注册\e[0m"
+        fi
+    else
+        echo -e "  MOK 密钥:        \e[90m未生成\e[0m"
+    fi
+
+    echo -e "  未签名模块:      ${#UNSIGNED_LIST[@]} 个"
+    echo -e "  引导链问题:      $BOOT_ISSUES 个"
+
+    echo ""
+
+    # 是否需要重启
+    local NEED_REBOOT=0
+    if [ -f "$MOK_DER" ] && command -v mokutil &>/dev/null; then
+        if mokutil --test-key "$MOK_DER" 2>/dev/null | grep -qi "not enrolled"; then
+            NEED_REBOOT=1
+        fi
+    fi
+    if [ $BOOT_ISSUES -gt 0 ]; then
+        NEED_REBOOT=1
+    fi
+
+    if [ $NEED_REBOOT -eq 1 ]; then
+        echo ""
+        warn "╔══════════════════════════════════════════════════════════╗"
+        warn "║  需要重启才能生效！                                      ║"
+        warn "║  重启时如出现蓝色 MOK Manager 界面：                     ║"
+        warn "║  Enroll MOK → Continue → Yes → 输入密码 → Reboot        ║"
+        warn "╚══════════════════════════════════════════════════════════╝"
+        echo ""
+        read -p "是否立即重启？(yes/no): " reboot_confirm
+        if [ "$reboot_confirm" = "yes" ]; then
+            reboot
+        else
+            warn "请稍后手动执行: sudo reboot"
+        fi
+    else
+        success "当前状态良好，无需重启"
+    fi
 }
 
 # ============================================================
@@ -1388,14 +1476,12 @@ do
     echo "  6. Check TPM Status           查看 TPM 状态"
     echo ""
     echo " ── Secure Boot ─────────────────────────────────"
-    echo "  7. Check Unsigned Modules     检查未签名模块并修复"
-    echo "  8. Show MOK Key Info          查看 MOK 密钥信息"
-    echo "  9. Repair Boot Chain          修复 Secure Boot 引导链"
+    echo "  7. Secure Boot Manager        诊断与修复"
     echo ""
     echo " ── 系统维护 ─────────────────────────────────────"
-    echo "  10. Update APT Sources        更新软件源"
-    echo "  11. Self Update               检查更新"
-    echo "  12. Uninstall GPU Manager     卸载本工具"
+    echo "  8. Update APT Sources         更新软件源"
+    echo "  9. Self Update                检查更新"
+    echo "  10. Uninstall GPU Manager     卸载本工具"
     echo "  0.  Exit                      退出"
     echo ""
 
@@ -1635,94 +1721,23 @@ do
             pause
             ;;
 
+
         7)
-            check_unsigned_modules
+            secure_boot_manager
             pause
             ;;
 
         8)
-            # 查看 MOK 密钥信息
-            echo -e "\e[36m"
-            echo "=================================================="
-            echo "           MOK 密钥信息 (MOK Key Info)"
-            echo "=================================================="
-            echo -e "\e[0m"
-
-            echo ""
-
-            # Secure Boot 状态
-            if check_secure_boot; then
-                success "Secure Boot: 已开启"
-            else
-                warn "Secure Boot: 未开启（MOK 签名非必需）"
-            fi
-
-            echo ""
-
-            # MOK 密钥文件
-            info "MOK 密钥文件："
-            if [ -f "$MOK_PRIV" ] && [ -f "$MOK_DER" ]; then
-                success "  私钥: $MOK_PRIV"
-                success "  证书: $MOK_DER"
-                echo ""
-
-                # 证书详情
-                info "证书详情："
-                openssl x509 -in "$MOK_DER" -inform DER -noout \
-                    -subject -issuer -dates -fingerprint -serial 2>/dev/null | sed 's/^/  /'
-                echo ""
-
-                # 注册状态
-                info "UEFI 注册状态："
-                if command -v mokutil &>/dev/null; then
-                    local MOK_TEST=$(mokutil --test-key "$MOK_DER" 2>/dev/null)
-                    if echo "$MOK_TEST" | grep -qi "already enrolled"; then
-                        success "  ✓ 已注册到 UEFI（生效中）"
-                    elif echo "$MOK_TEST" | grep -qi "not enrolled"; then
-                        warn "  ✗ 未注册到 UEFI（需重启在 MOK Manager 中确认）"
-                    else
-                        warn "  状态未知: $MOK_TEST"
-                    fi
-                else
-                    warn "  mokutil 未安装，无法查询注册状态"
-                fi
-
-                echo ""
-
-                # DKMS 自动签名配置
-                info "DKMS 自动签名："
-                if [ -f /etc/dkms/framework.conf ] && grep -q "sign_tool" /etc/dkms/framework.conf 2>/dev/null; then
-                    success "  ✓ 已配置（内核更新后自动签名）"
-                else
-                    warn "  ✗ 未配置（可通过选项 7 修复模块时自动配置）"
-                fi
-            else
-                warn "  MOK 密钥尚未生成"
-                echo ""
-                info "使用以下方式生成："
-                echo "  - 菜单选项 1（安装驱动时自动生成）"
-                echo "  - 菜单选项 7（检查未签名模块时自动生成）"
-            fi
-
-            pause
-            ;;
-
-        9)
-            repair_secure_boot_chain
-            pause
-            ;;
-
-        10)
             apt_update
             pause
             ;;
 
-        11)
+        9)
             self_update
             pause
             ;;
 
-        12)
+        10)
             warn "即将卸载 GPU Manager"
             confirm_action "是否继续"
             if [ $? -ne 0 ]; then
@@ -1741,6 +1756,7 @@ do
 
             exit 0
             ;;
+
 
         0)
             success "GPU Manager 已退出"
