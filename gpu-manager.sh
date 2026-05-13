@@ -1,10 +1,10 @@
 #!/bin/bash
 
 # ============================================================
-# GPU Manager v1.3.0
+# GPU Manager v1.5.0
 # ============================================================
 
-VERSION="1.4.0"
+VERSION="1.5.0"
 LOG_FILE="/var/log/gpu-manager.log"
 APT_TIMEOUT=120
 DRIVER_TIMEOUT=600
@@ -295,22 +295,46 @@ install_nvidia_driver() {
     local LOG_TMP="/tmp/gpu-manager-driver-install.log"
     local NEED_MOK=0
 
-    # ===== Secure Boot 预检 =====
-    if check_secure_boot; then
-        echo ""
-        info "╔══════════════════════════════════════════════════════╗"
-        info "║  检测到 Secure Boot 已开启                           ║"
-        info "╚══════════════════════════════════════════════════════╝"
-        echo ""
-        info "将使用 MOK 签名方案，确保驱动与 Secure Boot 兼容"
+    # ===== UEFI + MOK 预检 =====
+    # Ubuntu 24.04+ 的 ubuntu-drivers 已内置 DKMS 自动签名，无需手动处理
+    # 仅 22.04 及更早版本需要手动 MOK 签名
+    local UBUNTU_VER=""
+    if [ -f /etc/os-release ]; then
+        UBUNTU_VER=$(. /etc/os-release && echo "${VERSION_ID}")
+    fi
+
+    if [ -d /sys/firmware/efi ] && [ "$(echo "$UBUNTU_VER < 24.04" | bc 2>/dev/null)" = "1" ]; then
+        # Ubuntu 22.04 及更早版本：手动 MOK 签名
+        if check_secure_boot; then
+            echo ""
+            info "╔══════════════════════════════════════════════════════╗"
+            info "║  检测到 Secure Boot 已开启                           ║"
+            info "╚══════════════════════════════════════════════════════╝"
+            echo ""
+            info "将使用 MOK 签名方案，确保驱动与 Secure Boot 兼容"
+        else
+            echo ""
+            info "UEFI 系统，Secure Boot 当前未开启"
+            info "将自动签名驱动模块，以便后续开启 Secure Boot 时也能正常启动"
+        fi
         echo ""
 
         setup_mok_key
         if [ $? -ne 0 ]; then
-            error "MOK 配置失败，无法在 Secure Boot 下安装驱动"
-            return 1
+            warn "MOK 配置未完成，驱动仍会安装但不会签名"
+            warn "如后续开启 Secure Boot 可能导致无法启动"
+            echo ""
+            confirm_action "是否继续安装（不签名）"
+            if [ $? -ne 0 ]; then
+                return 1
+            fi
+        else
+            NEED_MOK=1
         fi
-        NEED_MOK=1
+    elif [ -d /sys/firmware/efi ]; then
+        # Ubuntu 24.04+：系统自带 DKMS 签名，无需手动处理
+        info "Ubuntu $UBUNTU_VER 已内置 DKMS 自动签名，无需额外 MOK 配置"
+        echo ""
     fi
 
     info "正在安装 NVIDIA 驱动 (ubuntu-drivers autoinstall)..."
@@ -532,8 +556,10 @@ get_status_bar() {
         else
             MOK_STATUS="\e[33m⚠ 未注册\e[0m"
         fi
+    elif check_secure_boot; then
+        MOK_STATUS="\e[31m✗ 未生成\e[0m"
     else
-        MOK_STATUS="\e[90m- 未生成\e[0m"
+        MOK_STATUS="\e[90m- 非必需\e[0m"
     fi
 
     echo -e "  GPU: $GPU_STATUS | 驱动: $DRIVER_STATUS | TPM: $TPM_STATUS | MOK: $MOK_STATUS"
@@ -831,6 +857,128 @@ tpm_status() {
 # ============================================================
 # 未签名内核模块检查与修复 (Secure Boot)
 # ============================================================
+
+# Secure Boot 引导链修复（shim + grub + MOK 证书）
+repair_secure_boot_chain() {
+    echo -e "\e[36m"
+    echo "=================================================="
+    echo "   Secure Boot 引导链修复 (Boot Chain Repair)"
+    echo "=================================================="
+    echo -e "\e[0m"
+
+    echo ""
+    info "本功能修复 UEFI 安全启动引导链（shim → GRUB → 内核）"
+    info "适用于出现以下报错的情况："
+    warn "  - error: shim_lock protocol not found"
+    warn "  - error: you need to load the kernel first"
+    echo ""
+
+    # Step 1: 检查 UEFI 模式
+    info "[1/5] 检查启动模式..."
+    if [ ! -d /sys/firmware/efi ]; then
+        error "当前系统不是 UEFI 模式，本修复仅适用于 UEFI 系统"
+        return 1
+    fi
+    success "UEFI 模式 ✓"
+
+    # 检查 EFI 分区
+    if ! mountpoint -q /boot/efi 2>/dev/null; then
+        error "EFI 分区未挂载在 /boot/efi"
+        error "请先确认 EFI 分区存在并挂载: mount /dev/nvmeXnXpX /boot/efi"
+        return 1
+    fi
+    success "EFI 分区已挂载: $(df -h /boot/efi | tail -1 | awk '{print $1, $2}')"
+    echo ""
+
+    confirm_action "是否开始修复 Secure Boot 引导链"
+    if [ $? -ne 0 ]; then
+        return 0
+    fi
+
+    echo ""
+
+    # Step 2: 重装安全启动依赖包
+    info "[2/5] 重装安全启动依赖包..."
+    apt_with_progress "更新软件源" update -qq
+    if [ $? -ne 0 ]; then
+        error "软件源更新失败"
+        return 1
+    fi
+
+    run_with_timeout 180 "安装 shim-signed + grub-efi + mokutil" \
+        apt-get install --reinstall -y shim-signed grub-efi-amd64 mokutil
+    if [ $? -ne 0 ]; then
+        error "依赖包安装失败"
+        return 1
+    fi
+    success "依赖包安装完成"
+    echo ""
+
+    # Step 3: 重装 UEFI GRUB
+    info "[3/5] 重装 UEFI 安全启动版 GRUB..."
+    grub-install --target=x86_64-efi --bootloader-id=ubuntu --efi-directory=/boot/efi --recheck 2>&1
+    if [ $? -ne 0 ]; then
+        error "GRUB 安装失败"
+        return 1
+    fi
+    success "GRUB 安装完成"
+
+    info "更新 GRUB 配置..."
+    update-grub 2>&1
+    if [ $? -ne 0 ]; then
+        error "GRUB 配置更新失败"
+        return 1
+    fi
+    success "GRUB 配置更新完成"
+    echo ""
+
+    # Step 4: 导入 Ubuntu 官方 MOK 证书
+    info "[4/5] 导入 Ubuntu 官方安全启动密钥..."
+
+    local SHIM_MOK="/usr/share/shim-signed/mok.crt"
+    if [ ! -f "$SHIM_MOK" ]; then
+        # 备用路径
+        SHIM_MOK=$(find /usr/share/shim-signed/ -name "*.crt" 2>/dev/null | head -1)
+    fi
+
+    if [ -z "$SHIM_MOK" ] || [ ! -f "$SHIM_MOK" ]; then
+        warn "未找到 shim 官方 MOK 证书文件"
+        warn "跳过证书导入（如已有证书可忽略）"
+    else
+        echo ""
+        warn "接下来需要设置一个临时密码（重启时在蓝色界面输入）"
+        echo ""
+        mokutil --import "$SHIM_MOK"
+        if [ $? -eq 0 ]; then
+            success "MOK 证书已提交注册请求"
+        else
+            warn "MOK 证书导入失败（如已注册可忽略）"
+        fi
+    fi
+
+    echo ""
+
+    # Step 5: 提示重启
+    info "[5/5] 修复完成"
+    echo ""
+    success "╔══════════════════════════════════════════════════════════╗"
+    success "║  Secure Boot 引导链修复完成！                            ║"
+    success "╚══════════════════════════════════════════════════════════╝"
+    echo ""
+    warn "重启后操作："
+    warn "  1) 如果出现蓝色 MOK Manager 界面："
+    warn "     Enroll MOK → Continue → Yes → 输入刚才的密码 → Reboot"
+    warn "  2) 进入系统后验证: mokutil --sb-state"
+    warn "     应显示: SecureBoot enabled"
+    echo ""
+
+    read -p "是否立即重启？(yes/no): " reboot_confirm
+    if [ "$reboot_confirm" = "yes" ]; then
+        reboot
+    else
+        warn "请稍后手动执行: sudo reboot"
+    fi
+}
 
 check_unsigned_modules() {
     echo -e "\e[36m"
@@ -1242,12 +1390,13 @@ do
     echo " ── Secure Boot ─────────────────────────────────"
     echo "  7. Check Unsigned Modules     检查未签名模块并修复"
     echo "  8. Show MOK Key Info          查看 MOK 密钥信息"
+    echo "  9. Repair Boot Chain          修复 Secure Boot 引导链"
     echo ""
     echo " ── 系统维护 ─────────────────────────────────────"
-    echo "  9. Update APT Sources         更新软件源"
-    echo "  s. Self Update                检查更新"
-    echo "  u. Uninstall GPU Manager      卸载本工具"
-    echo "  0. Exit                       退出"
+    echo "  10. Update APT Sources        更新软件源"
+    echo "  11. Self Update               检查更新"
+    echo "  12. Uninstall GPU Manager     卸载本工具"
+    echo "  0.  Exit                      退出"
     echo ""
 
     read -p "请选择功能 Select Option: " choice
@@ -1559,16 +1708,21 @@ do
             ;;
 
         9)
+            repair_secure_boot_chain
+            pause
+            ;;
+
+        10)
             apt_update
             pause
             ;;
 
-        s)
+        11)
             self_update
             pause
             ;;
 
-        u)
+        12)
             warn "即将卸载 GPU Manager"
             confirm_action "是否继续"
             if [ $? -ne 0 ]; then

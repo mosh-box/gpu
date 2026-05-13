@@ -2,7 +2,7 @@
 
 set -e
 
-VERSION="1.3.0"
+VERSION="1.5.0"
 INSTALL_PATH="/usr/local/bin/gpu-manager"
 REPO_URLS=(
     "https://raw.githubusercontent.com/mosh-box/gpu/main"
