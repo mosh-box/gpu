@@ -4,7 +4,7 @@
 # GPU Manager v1.5.0
 # ============================================================
 
-VERSION="1.5.0"
+VERSION="1.5.1"
 LOG_FILE="/var/log/gpu-manager.log"
 APT_TIMEOUT=120
 DRIVER_TIMEOUT=600
@@ -239,9 +239,30 @@ sign_nvidia_modules() {
 
     while read -r MOD; do
         if [ -n "$MOD" ]; then
-            "$SIGN_FILE" sha256 "$MOK_PRIV" "$MOK_DER" "$MOD" 2>/dev/null
+            local ACTUAL_MOD="$MOD"
+            local COMPRESSED=0
+
+            # 处理压缩模块：解压 → 签名 → 重新压缩
+            if [[ "$MOD" == *.ko.zst ]]; then
+                zstd -d -f "$MOD" -o "${MOD%.zst}" 2>/dev/null
+                ACTUAL_MOD="${MOD%.zst}"
+                COMPRESSED=1
+            elif [[ "$MOD" == *.ko.xz ]]; then
+                xz -d -f -k "$MOD" 2>/dev/null
+                ACTUAL_MOD="${MOD%.xz}"
+                COMPRESSED=2
+            fi
+
+            "$SIGN_FILE" sha256 "$MOK_PRIV" "$MOK_DER" "$ACTUAL_MOD" 2>/dev/null
             if [ $? -eq 0 ]; then
                 SIGNED_COUNT=$((SIGNED_COUNT + 1))
+                # 重新压缩
+                if [ $COMPRESSED -eq 1 ]; then
+                    zstd -f "$ACTUAL_MOD" -o "$MOD" 2>/dev/null
+                    rm -f "$ACTUAL_MOD"
+                elif [ $COMPRESSED -eq 2 ]; then
+                    xz -f "$ACTUAL_MOD" 2>/dev/null
+                fi
             fi
         fi
     done <<< "$NVIDIA_MODULES"
@@ -348,10 +369,70 @@ install_nvidia_driver() {
             setup_dkms_auto_sign
         fi
     elif [ -d /sys/firmware/efi ]; then
-        # Ubuntu 24.04+：系统自带 DKMS 签名，无需手动处理
-        info "Ubuntu $UBUNTU_VER 已内置 DKMS 自动签名，无需额外 MOK 配置"
+        # Ubuntu 24.04+：ubuntu-drivers 内置 DKMS 签名流程
+        # 但仍需确保有 MOK 密钥，ubuntu-drivers 会自动使用它
+        if check_secure_boot; then
+            info "Ubuntu $UBUNTU_VER + Secure Boot: 使用系统内置 DKMS 签名"
+            info "ubuntu-drivers 会自动处理 MOK 注册流程"
+        else
+            info "Ubuntu $UBUNTU_VER UEFI 系统，Secure Boot 未开启"
+        fi
         echo ""
     fi
+
+    # 检查 dpkg 锁（避免安装过程卡住）
+    if fuser /var/lib/dpkg/lock-frontend &>/dev/null || fuser /var/lib/apt/lists/lock &>/dev/null; then
+        warn "检测到 apt/dpkg 被其他进程占用"
+        warn "正在等待锁释放（最多 60s）..."
+        local LOCK_WAIT=0
+        while fuser /var/lib/dpkg/lock-frontend &>/dev/null 2>&1 && [ $LOCK_WAIT -lt 60 ]; do
+            sleep 2
+            LOCK_WAIT=$((LOCK_WAIT + 2))
+        done
+        if [ $LOCK_WAIT -ge 60 ]; then
+            error "dpkg 锁超时，请手动关闭其他 apt 进程后重试"
+            error "  sudo killall apt apt-get 2>/dev/null; sudo dpkg --configure -a"
+            return 1
+        fi
+        success "dpkg 锁已释放"
+    fi
+
+    # 修复可能的 dpkg 中断状态
+    if dpkg --audit 2>&1 | grep -q "."; then
+        info "检测到 dpkg 未完成配置，正在修复..."
+        dpkg --configure -a 2>/dev/null
+    fi
+
+    # 确保 ubuntu-drivers 可用
+    if ! command -v ubuntu-drivers &>/dev/null; then
+        info "安装 ubuntu-drivers-common..."
+        apt-get install -y ubuntu-drivers-common > /dev/null 2>&1
+        if ! command -v ubuntu-drivers &>/dev/null; then
+            error "ubuntu-drivers-common 安装失败，无法继续"
+            return 1
+        fi
+    fi
+
+    # 检查推荐驱动版本
+    local RECOMMENDED=$(ubuntu-drivers devices 2>/dev/null | grep "recommended" | awk '{print $3}')
+    if [ -n "$RECOMMENDED" ]; then
+        info "系统推荐驱动: $RECOMMENDED"
+    else
+        warn "未检测到推荐驱动版本，将使用 autoinstall 自动选择"
+    fi
+
+    # 确保内核头文件存在（DKMS 编译必需）
+    local KVER=$(uname -r)
+    if [ ! -d "/usr/src/linux-headers-$KVER" ]; then
+        info "安装内核头文件 linux-headers-$KVER（DKMS 编译必需）..."
+        apt-get install -y "linux-headers-$KVER" > /dev/null 2>&1
+        if [ ! -d "/usr/src/linux-headers-$KVER" ]; then
+            warn "内核头文件安装失败，DKMS 编译可能失败"
+        else
+            success "内核头文件已就位"
+        fi
+    fi
+    echo ""
 
     info "正在安装 NVIDIA 驱动 (ubuntu-drivers autoinstall)..."
     echo ""
@@ -463,6 +544,19 @@ install_nvidia_driver() {
     echo ""
     if [ $EXIT_CODE -eq 0 ]; then
         success "NVIDIA 驱动安装完成（耗时 ${MINS}m${SECS}s）"
+
+        # 验证驱动模块文件已安装到位（真正生效需重启）
+        local INSTALLED_MOD=$(find /lib/modules/$(uname -r) -name "nvidia*.ko*" 2>/dev/null | head -1)
+        if [ -n "$INSTALLED_MOD" ]; then
+            success "NVIDIA 内核模块已安装: $(basename $INSTALLED_MOD)"
+            local DKMS_ST=$(dkms status 2>/dev/null | grep -i nvidia | head -1)
+            if [ -n "$DKMS_ST" ]; then
+                success "DKMS 状态: $DKMS_ST"
+            fi
+        else
+            warn "未找到 NVIDIA 内核模块文件，DKMS 编译可能失败"
+            warn "请检查日志: /tmp/gpu-manager-driver-install.log"
+        fi
 
         # Secure Boot: 签名模块
         if [ $NEED_MOK -eq 1 ]; then
@@ -1171,6 +1265,71 @@ secure_boot_manager() {
 
     local BOOT_ISSUES=0
 
+    # 检查 EFI 分区文件系统完整性
+    local EFI_DEV=$(df /boot/efi 2>/dev/null | tail -1 | awk '{print $1}')
+    if [ -n "$EFI_DEV" ] && [ -b "$EFI_DEV" ]; then
+        info "  检查 EFI 分区文件系统 ($EFI_DEV)..."
+
+        # 检查是否已经被 remount-ro（这是导致文件丢失的关键原因）
+        if mount | grep "/boot/efi" | grep -q "\bro\b"; then
+            warn "  EFI 分区已被切换为只读模式！正在修复..."
+            umount /boot/efi 2>/dev/null
+            fsck.vfat -a "$EFI_DEV" 2>&1 | sed 's/^/    /'
+            mount -o rw,fmask=0077,dmask=0077 "$EFI_DEV" /boot/efi 2>/dev/null
+            if mount | grep "/boot/efi" | grep -q "\bro\b"; then
+                error "  EFI 分区仍为只读，可能存在硬件问题"
+                BOOT_ISSUES=$((BOOT_ISSUES + 1))
+            else
+                success "  EFI 分区已恢复为读写模式 ✓"
+            fi
+        fi
+
+        # 尝试读取 shimx64.efi 来检测文件系统是否损坏
+        if [ -f /boot/efi/EFI/ubuntu/shimx64.efi ]; then
+            if ! cat /boot/efi/EFI/ubuntu/shimx64.efi > /dev/null 2>&1; then
+                warn "  EFI 分区文件系统可能损坏（文件存在但无法读取）"
+                warn "  正在修复..."
+                umount /boot/efi 2>/dev/null
+                fsck.vfat -a "$EFI_DEV" 2>&1 | sed 's/^/    /'
+                mount -o rw,fmask=0077,dmask=0077 "$EFI_DEV" /boot/efi 2>/dev/null
+                if cat /boot/efi/EFI/ubuntu/shimx64.efi > /dev/null 2>&1; then
+                    success "  EFI 文件系统修复成功 ✓"
+                else
+                    error "  EFI 文件系统修复后仍无法读取，需要重装引导文件"
+                    BOOT_ISSUES=$((BOOT_ISSUES + 1))
+                fi
+            else
+                success "  EFI 文件系统: ✓ 完整可读"
+            fi
+        else
+            # shimx64.efi 不存在，也检查下文件系统
+            # dirty bit 可能导致文件丢失
+            warn "  shimx64.efi 不存在，检查文件系统..."
+            local FSCK_OUT=$(fsck.vfat -n "$EFI_DEV" 2>&1)
+            if echo "$FSCK_OUT" | grep -qi "dirty\|corrupt\|error"; then
+                warn "  EFI 分区文件系统异常，正在修复..."
+                umount /boot/efi 2>/dev/null
+                fsck.vfat -a "$EFI_DEV" 2>&1 | sed 's/^/    /'
+                mount -o rw,fmask=0077,dmask=0077 "$EFI_DEV" /boot/efi 2>/dev/null
+                success "  EFI 文件系统已修复"
+            else
+                # 文件系统正常但 shim 缺失，直接标记需修复
+                BOOT_ISSUES=$((BOOT_ISSUES + 1))
+            fi
+        fi
+
+        # 修复 fstab 中的 errors=remount-ro（防止未来再次发生只读切换）
+        if grep -q "/boot/efi.*errors=remount-ro" /etc/fstab 2>/dev/null; then
+            warn "  检测到 fstab 中 EFI 分区使用 errors=remount-ro"
+            warn "  这会导致任何 IO 错误后 EFI 分区变为只读，写入静默失败"
+            info "  正在修改为 errors=continue..."
+            sed -i '/\/boot\/efi/s/errors=remount-ro/errors=continue/' /etc/fstab
+            success "  fstab 已更新 ✓"
+        fi
+    fi
+
+    echo ""
+
     # 检查 shim
     if dpkg -l shim-signed 2>/dev/null | grep -q "^ii"; then
         success "  shim-signed: ✓ 已安装"
@@ -1202,6 +1361,28 @@ secure_boot_manager() {
         BOOT_ISSUES=$((BOOT_ISSUES + 1))
     fi
 
+    # 检查 UEFI 启动项是否正确指向 shimx64.efi
+    if command -v efibootmgr &>/dev/null; then
+        local EFI_ENTRY=$(efibootmgr -v 2>/dev/null | grep -i "ubuntu" | head -1)
+        if [ -n "$EFI_ENTRY" ]; then
+            if echo "$EFI_ENTRY" | grep -qi "shimx64.efi"; then
+                success "  UEFI 启动项: ✓ 指向 shimx64.efi"
+            elif echo "$EFI_ENTRY" | grep -qi "grubx64.efi"; then
+                warn "  UEFI 启动项: ✗ 直接指向 grubx64.efi（应指向 shimx64.efi）"
+                warn "    这是导致 'shim_lock protocol not found' 的直接原因"
+                BOOT_ISSUES=$((BOOT_ISSUES + 1))
+            else
+                warn "  UEFI 启动项: ⚠ 无法识别路径"
+                echo "    $EFI_ENTRY"
+            fi
+        else
+            warn "  UEFI 启动项: ✗ 未找到 ubuntu 启动项"
+            BOOT_ISSUES=$((BOOT_ISSUES + 1))
+        fi
+    else
+        warn "  efibootmgr: 未安装，无法检查启动项"
+    fi
+
     echo ""
 
     if [ $BOOT_ISSUES -gt 0 ]; then
@@ -1215,6 +1396,31 @@ secure_boot_manager() {
         if [ "$fix_boot" = "y" ]; then
             echo ""
             info "  修复引导链..."
+
+            # 先修复 EFI 文件系统（确保写入不会损坏）
+            if [ -n "$EFI_DEV" ] && [ -b "$EFI_DEV" ]; then
+                info "  检查并修复 EFI 分区文件系统..."
+                umount /boot/efi 2>/dev/null
+                fsck.vfat -a "$EFI_DEV" 2>&1 | sed 's/^/    /'
+                # 强制以 rw 模式挂载，避免 errors=remount-ro 导致静默只读
+                mount -o rw,fmask=0077,dmask=0077 "$EFI_DEV" /boot/efi 2>/dev/null
+                # 验证挂载确实是 rw
+                if mount | grep "/boot/efi" | grep -q "\bro\b"; then
+                    error "  EFI 分区无法以读写模式挂载！可能存在硬件问题"
+                    error "  请检查 NVMe SSD 健康状态"
+                    pause
+                    return
+                fi
+                # 测试写入能力
+                if ! touch /boot/efi/.write_test 2>/dev/null; then
+                    error "  EFI 分区无法写入！"
+                    pause
+                    return
+                fi
+                rm -f /boot/efi/.write_test
+                success "  EFI 文件系统检查完成，读写正常 ✓"
+                echo ""
+            fi
 
             apt_with_progress "更新软件源" update -qq
             run_with_timeout 180 "重装 shim-signed + grub-efi + mokutil" \
@@ -1234,6 +1440,69 @@ secure_boot_manager() {
                     error "  GRUB 安装失败"
                 fi
 
+                # 确保 UEFI 启动项指向 shimx64.efi
+                if command -v efibootmgr &>/dev/null; then
+                    local CURRENT_ENTRY=$(efibootmgr -v 2>/dev/null | grep -i "ubuntu" | head -1)
+                    if [ -z "$CURRENT_ENTRY" ]; then
+                        # 没有 ubuntu 启动项，需要创建
+                        info "  未找到 ubuntu 启动项，正在创建..."
+                        local EFI_DEV=$(df /boot/efi 2>/dev/null | tail -1 | awk '{print $1}')
+                        if [ -n "$EFI_DEV" ]; then
+                            local EFI_DISK=$(echo "$EFI_DEV" | sed 's/p\?[0-9]*$//')
+                            local EFI_PART=$(echo "$EFI_DEV" | grep -oP '\d+$')
+                            efibootmgr -c -d "$EFI_DISK" -p "$EFI_PART" -L "ubuntu" -l "\\EFI\\ubuntu\\shimx64.efi" 2>/dev/null
+                            if [ $? -eq 0 ]; then
+                                success "  UEFI 启动项已创建: shimx64.efi ✓"
+                            else
+                                error "  UEFI 启动项创建失败"
+                                warn "  请手动执行: sudo efibootmgr -c -d <磁盘> -p <分区号> -L ubuntu -l \\\\EFI\\\\ubuntu\\\\shimx64.efi"
+                            fi
+                        fi
+                    elif echo "$CURRENT_ENTRY" | grep -qi "grubx64.efi" && ! echo "$CURRENT_ENTRY" | grep -qi "shimx64.efi"; then
+                        info "  修正 UEFI 启动项指向 shimx64.efi..."
+                        local EFI_DEV=$(df /boot/efi 2>/dev/null | tail -1 | awk '{print $1}')
+                        if [ -n "$EFI_DEV" ]; then
+                            local EFI_DISK=$(echo "$EFI_DEV" | sed 's/p\?[0-9]*$//')
+                            local EFI_PART=$(echo "$EFI_DEV" | grep -oP '\d+$')
+                            local OLD_BOOTNUM=$(efibootmgr 2>/dev/null | grep -i "ubuntu" | head -1 | grep -oP 'Boot\K[0-9A-Fa-f]+')
+                            if [ -n "$OLD_BOOTNUM" ]; then
+                                efibootmgr -b "$OLD_BOOTNUM" -B 2>/dev/null
+                            fi
+                            efibootmgr -c -d "$EFI_DISK" -p "$EFI_PART" -L "ubuntu" -l "\\EFI\\ubuntu\\shimx64.efi" 2>/dev/null
+                            if [ $? -eq 0 ]; then
+                                success "  UEFI 启动项已修正为 shimx64.efi ✓"
+                            else
+                                error "  UEFI 启动项修正失败"
+                                warn "  请手动执行: sudo efibootmgr -c -d <磁盘> -p <分区号> -L ubuntu -l \\\\EFI\\\\ubuntu\\\\shimx64.efi"
+                            fi
+                        fi
+                    else
+                        success "  UEFI 启动项已正确指向 shimx64.efi ✓"
+                    fi
+                fi
+
+                # 复制 shimx64.efi 到 fallback 路径（解决部分 HP 固件忽略 ubuntu 启动项的问题）
+                if [ -f /boot/efi/EFI/ubuntu/shimx64.efi ]; then
+                    mkdir -p /boot/efi/EFI/Boot 2>/dev/null
+                    cp -f /boot/efi/EFI/ubuntu/shimx64.efi /boot/efi/EFI/Boot/bootx64.efi 2>/dev/null
+                    if [ $? -eq 0 ]; then
+                        success "  Fallback 引导: ✓ 已复制到 EFI/Boot/bootx64.efi"
+                    fi
+                fi
+
+                # 强制同步所有写入到磁盘（关键！防止 EFI 分区因 errors=remount-ro 丢失数据）
+                info "  同步数据到磁盘..."
+                sync
+                sync
+                sync
+                # 验证文件确实写入成功
+                if [ -f /boot/efi/EFI/ubuntu/shimx64.efi ]; then
+                    success "  shimx64.efi 验证: ✓ 文件存在且可读"
+                else
+                    error "  shimx64.efi 验证失败！文件不存在"
+                    error "  EFI 分区可能存在严重问题，建议检查硬件"
+                fi
+
                 # 导入 shim MOK 证书
                 local SHIM_MOK="/usr/share/shim-signed/mok.crt"
                 if [ ! -f "$SHIM_MOK" ]; then
@@ -1251,7 +1520,128 @@ secure_boot_manager() {
             fi
         fi
     else
-        success "  引导链完整，无需修复 ✓"
+        success "  引导链完整 ✓"
+        echo ""
+        echo "  如仍有 Secure Boot 启动问题，是否强制修复引导链？"
+        read -p "  (y/n): " force_fix
+        if [ "$force_fix" = "y" ]; then
+            echo ""
+            info "  强制修复引导链..."
+
+            # 先修复 EFI 文件系统
+            if [ -n "$EFI_DEV" ] && [ -b "$EFI_DEV" ]; then
+                info "  检查并修复 EFI 分区文件系统..."
+                umount /boot/efi 2>/dev/null
+                fsck.vfat -a "$EFI_DEV" 2>&1 | sed 's/^/    /'
+                mount -o rw,fmask=0077,dmask=0077 "$EFI_DEV" /boot/efi 2>/dev/null
+                # 验证 rw 挂载
+                if mount | grep "/boot/efi" | grep -q "\bro\b"; then
+                    error "  EFI 分区无法以读写模式挂载！可能存在硬件问题"
+                    pause
+                    return
+                fi
+                if ! touch /boot/efi/.write_test 2>/dev/null; then
+                    error "  EFI 分区无法写入！"
+                    pause
+                    return
+                fi
+                rm -f /boot/efi/.write_test
+                success "  EFI 文件系统检查完成，读写正常 ✓"
+                echo ""
+            fi
+
+            apt_with_progress "更新软件源" update -qq
+            run_with_timeout 180 "重装 shim-signed + grub-efi + mokutil" \
+                apt-get install --reinstall -y shim-signed grub-efi-amd64 mokutil
+
+            if [ $? -ne 0 ]; then
+                error "  依赖包安装失败"
+            else
+                success "  依赖包重装完成"
+
+                grub-install --target=x86_64-efi --bootloader-id=ubuntu --efi-directory=/boot/efi --recheck 2>&1
+                if [ $? -eq 0 ]; then
+                    success "  GRUB 重装完成"
+                    update-grub 2>&1
+                    success "  GRUB 配置更新完成"
+                else
+                    error "  GRUB 安装失败"
+                fi
+
+                # 确保 UEFI 启动项指向 shimx64.efi
+                if command -v efibootmgr &>/dev/null; then
+                    local CURRENT_ENTRY=$(efibootmgr -v 2>/dev/null | grep -i "ubuntu" | head -1)
+                    if [ -z "$CURRENT_ENTRY" ]; then
+                        info "  未找到 ubuntu 启动项，正在创建..."
+                        local EFI_DEV=$(df /boot/efi 2>/dev/null | tail -1 | awk '{print $1}')
+                        if [ -n "$EFI_DEV" ]; then
+                            local EFI_DISK=$(echo "$EFI_DEV" | sed 's/p\?[0-9]*$//')
+                            local EFI_PART=$(echo "$EFI_DEV" | grep -oP '\d+$')
+                            efibootmgr -c -d "$EFI_DISK" -p "$EFI_PART" -L "ubuntu" -l "\\EFI\\ubuntu\\shimx64.efi" 2>/dev/null
+                            if [ $? -eq 0 ]; then
+                                success "  UEFI 启动项已创建: shimx64.efi ✓"
+                            else
+                                error "  UEFI 启动项创建失败"
+                            fi
+                        fi
+                    elif echo "$CURRENT_ENTRY" | grep -qi "grubx64.efi" && ! echo "$CURRENT_ENTRY" | grep -qi "shimx64.efi"; then
+                        info "  修正 UEFI 启动项指向 shimx64.efi..."
+                        local EFI_DEV=$(df /boot/efi 2>/dev/null | tail -1 | awk '{print $1}')
+                        if [ -n "$EFI_DEV" ]; then
+                            local EFI_DISK=$(echo "$EFI_DEV" | sed 's/p\?[0-9]*$//')
+                            local EFI_PART=$(echo "$EFI_DEV" | grep -oP '\d+$')
+                            local OLD_BOOTNUM=$(efibootmgr 2>/dev/null | grep -i "ubuntu" | head -1 | grep -oP 'Boot\K[0-9A-Fa-f]+')
+                            if [ -n "$OLD_BOOTNUM" ]; then
+                                efibootmgr -b "$OLD_BOOTNUM" -B 2>/dev/null
+                            fi
+                            efibootmgr -c -d "$EFI_DISK" -p "$EFI_PART" -L "ubuntu" -l "\\EFI\\ubuntu\\shimx64.efi" 2>/dev/null
+                            if [ $? -eq 0 ]; then
+                                success "  UEFI 启动项已修正为 shimx64.efi ✓"
+                            fi
+                        fi
+                    else
+                        success "  UEFI 启动项已正确指向 shimx64.efi ✓"
+                    fi
+                fi
+
+                # 复制 shimx64.efi 到 fallback 路径（解决部分 HP 固件忽略启动项的问题）
+                if [ -f /boot/efi/EFI/ubuntu/shimx64.efi ]; then
+                    mkdir -p /boot/efi/EFI/Boot 2>/dev/null
+                    cp -f /boot/efi/EFI/ubuntu/shimx64.efi /boot/efi/EFI/Boot/bootx64.efi 2>/dev/null
+                    if [ $? -eq 0 ]; then
+                        success "  Fallback 引导: ✓ 已复制到 EFI/Boot/bootx64.efi"
+                    fi
+                fi
+
+                # 强制同步到磁盘
+                info "  同步数据到磁盘..."
+                sync
+                sync
+                sync
+                if [ -f /boot/efi/EFI/ubuntu/shimx64.efi ]; then
+                    success "  shimx64.efi 验证: ✓ 文件存在且可读"
+                else
+                    error "  shimx64.efi 验证失败！文件不存在"
+                    error "  EFI 分区可能存在严重问题，建议检查硬件"
+                fi
+
+                # 导入 shim MOK 证书
+                local SHIM_MOK="/usr/share/shim-signed/mok.crt"
+                if [ ! -f "$SHIM_MOK" ]; then
+                    SHIM_MOK=$(find /usr/share/shim-signed/ -name "*.crt" 2>/dev/null | head -1)
+                fi
+                if [ -n "$SHIM_MOK" ] && [ -f "$SHIM_MOK" ]; then
+                    echo ""
+                    warn "  需要设置一个临时密码（重启时在蓝色 MOK Manager 界面输入）"
+                    echo ""
+                    mokutil --import "$SHIM_MOK"
+                    if [ $? -eq 0 ]; then
+                        success "  MOK 证书已提交注册请求"
+                    fi
+                fi
+            fi
+            BOOT_ISSUES=1
+        fi
     fi
 
     # ===== 汇总 =====
@@ -1573,6 +1963,13 @@ do
 
             echo ""
 
+            # 更新软件源（确保能找到最新驱动版本）
+            apt_update
+            if [ $? -ne 0 ]; then
+                pause
+                continue
+            fi
+
             # 使用专用驱动安装函数
             install_nvidia_driver
 
@@ -1771,3 +2168,4 @@ do
     esac
 
 done
+
