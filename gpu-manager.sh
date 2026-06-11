@@ -861,52 +861,93 @@ auto_install_drivers() {
 }
 
 # ============================================================
-# 自动卸载 NVIDIA 驱动 + MOK 密钥
+# 自动卸载 NVIDIA 驱动 / MOK 密钥（可选范围）
 # ============================================================
 
-auto_remove_nvidia_and_mok() {
-    preflight || return 1
+remove_nvidia_driver() {
+    info "正在自动卸载 NVIDIA 驱动..."
+    local NVIDIA_PACKAGES=$(dpkg -l | awk '/^ii/ && $2 ~ /nvidia/ {print $2}')
 
-    warn "本操作将自动卸载全部 NVIDIA 驱动，并删除 GPU Manager 的 MOK 密钥"
+    if [ -z "$NVIDIA_PACKAGES" ]; then
+        success "未检测到已安装的 NVIDIA 驱动包"
+        return 0
+    fi
+
+    echo "$NVIDIA_PACKAGES" | sed 's/^/  /'
+    echo ""
+    run_with_timeout $DRIVER_TIMEOUT "卸载 NVIDIA 驱动包" apt-get purge -y $NVIDIA_PACKAGES
+    if [ $? -ne 0 ]; then
+        error "NVIDIA 驱动卸载失败"
+        error "详细日志: /tmp/gpu-manager-cmd-output.log"
+        return 1
+    fi
+    apt_with_progress "清理无用依赖" autoremove --purge -y
+    success "NVIDIA 驱动已全部卸载"
+
+    # 恢复 Nouveau（删除黑名单，让开源驱动接管显示）
+    if [ -f /etc/modprobe.d/blacklist-nouveau.conf ]; then
+        rm -f /etc/modprobe.d/blacklist-nouveau.conf
+        run_with_timeout 180 "更新 initramfs" update-initramfs -u
+        success "已恢复 Nouveau 开源驱动（重启后生效）"
+    fi
+
+    return 0
+}
+
+auto_remove_nvidia_and_mok() {
+    echo ""
+    echo "  请选择卸载范围："
+    echo "    a. 全部卸载（NVIDIA 驱动 + MOK 密钥）"
+    echo "    b. 仅卸载 NVIDIA 驱动"
+    echo "    c. 仅卸载 MOK 密钥"
+    echo "    q. 取消"
+    echo ""
+    read -p "  请选择 (a/b/c/q): " remove_choice
+
+    local DO_DRIVER=0
+    local DO_MOK=0
+    case "$remove_choice" in
+        a) DO_DRIVER=1; DO_MOK=1 ;;
+        b) DO_DRIVER=1 ;;
+        c) DO_MOK=1 ;;
+        *)
+            warn "已取消操作"
+            return 1
+            ;;
+    esac
+
+    if [ $DO_DRIVER -eq 1 ] && [ $DO_MOK -eq 1 ]; then
+        warn "本操作将自动卸载全部 NVIDIA 驱动，并删除 GPU Manager 的 MOK 密钥"
+    elif [ $DO_DRIVER -eq 1 ]; then
+        warn "本操作将自动卸载全部 NVIDIA 驱动"
+    else
+        warn "本操作将删除 GPU Manager 的 MOK 密钥"
+    fi
     confirm_action "确认继续"
     if [ $? -ne 0 ]; then
         return 1
     fi
     echo ""
 
-    # ===== 卸载 NVIDIA 驱动 =====
-    info "[1/2] 自动卸载 NVIDIA 驱动..."
-    local NVIDIA_PACKAGES=$(dpkg -l | awk '/^ii/ && $2 ~ /nvidia/ {print $2}')
+    preflight || return 1
 
-    if [ -z "$NVIDIA_PACKAGES" ]; then
-        success "未检测到已安装的 NVIDIA 驱动包"
-    else
-        echo "$NVIDIA_PACKAGES" | sed 's/^/  /'
+    local STEP=0
+    local TOTAL=$((DO_DRIVER + DO_MOK))
+
+    if [ $DO_DRIVER -eq 1 ]; then
+        STEP=$((STEP + 1))
+        info "[$STEP/$TOTAL] 卸载 NVIDIA 驱动..."
+        remove_nvidia_driver || return 1
         echo ""
-        run_with_timeout $DRIVER_TIMEOUT "卸载 NVIDIA 驱动包" apt-get purge -y $NVIDIA_PACKAGES
-        if [ $? -ne 0 ]; then
-            error "NVIDIA 驱动卸载失败"
-            error "详细日志: /tmp/gpu-manager-cmd-output.log"
-            return 1
-        fi
-        apt_with_progress "清理无用依赖" autoremove --purge -y
-        success "NVIDIA 驱动已全部卸载"
-
-        # 恢复 Nouveau（删除黑名单，让开源驱动接管显示）
-        if [ -f /etc/modprobe.d/blacklist-nouveau.conf ]; then
-            rm -f /etc/modprobe.d/blacklist-nouveau.conf
-            run_with_timeout 180 "更新 initramfs" update-initramfs -u
-            success "已恢复 Nouveau 开源驱动（重启后生效）"
-        fi
     fi
 
-    echo ""
+    if [ $DO_MOK -eq 1 ]; then
+        STEP=$((STEP + 1))
+        info "[$STEP/$TOTAL] 卸载 MOK 密钥..."
+        remove_mok_key
+        echo ""
+    fi
 
-    # ===== 卸载 MOK 密钥 =====
-    info "[2/2] 自动卸载 MOK 密钥..."
-    remove_mok_key
-
-    echo ""
     success "卸载完成"
     ask_reboot
     return 0
@@ -1281,7 +1322,7 @@ do
     echo " ── GPU 驱动管理 ──────────────────────────────────"
     echo "  1. Auto Install GPU Driver    自动检测并安装驱动 (NVIDIA/AMD)"
     echo "  2. Check GPU Status           检查 GPU 状态"
-    echo "  3. Remove Driver & MOK        自动卸载 NVIDIA 驱动 + MOK 密钥"
+    echo "  3. Remove Driver / MOK        卸载 NVIDIA 驱动 / MOK 密钥（可选范围）"
     echo ""
     echo " ── TPM 磁盘加密 ─────────────────────────────────"
     echo "  4. Rebind TPM                 重新绑定 TPM"
