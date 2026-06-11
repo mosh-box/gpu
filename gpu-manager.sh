@@ -4,7 +4,7 @@
 # GPU Manager
 # ============================================================
 
-VERSION="1.6.1"
+VERSION="1.6.2"
 LOG_FILE="/var/log/gpu-manager.log"
 APT_TIMEOUT=300
 DRIVER_TIMEOUT=600
@@ -20,6 +20,10 @@ MOK_PASSWORD="enkey123"
 APT_FRESH=0
 MOK_ENROLL_PENDING=0
 MOK_DELETE_PENDING=0
+
+# 卸载流程实际执行情况（用于判断是否需要询问重启）
+DRIVER_REMOVED=0
+MOK_CLEANED=0
 
 # ============================================================
 # 工具函数
@@ -413,16 +417,20 @@ remove_mok_key() {
         # 删除密钥文件
         rm -rf "$MOK_KEY_DIR"
         success "MOK 密钥文件已删除: $MOK_KEY_DIR"
+        MOK_CLEANED=1
     fi
 
     # 清理 DKMS 自动签名配置
     if [ -f /etc/dkms/sign_helper.sh ]; then
         rm -f /etc/dkms/sign_helper.sh
         success "DKMS 签名脚本已删除"
+        MOK_CLEANED=1
     fi
-    if [ -f /etc/dkms/framework.conf ]; then
+    if [ -f /etc/dkms/framework.conf ] && \
+       grep -qE 'GPU Manager: auto-sign|sign_helper\.sh|/var/lib/gpu-manager/mok' /etc/dkms/framework.conf; then
         sed -i '/GPU Manager: auto-sign/d; /sign_helper\.sh/d; /\/var\/lib\/gpu-manager\/mok/d' /etc/dkms/framework.conf
         success "DKMS 自动签名配置已清理"
+        MOK_CLEANED=1
     fi
 
     return 0
@@ -869,7 +877,7 @@ remove_nvidia_driver() {
     local NVIDIA_PACKAGES=$(dpkg -l | awk '/^ii/ && $2 ~ /nvidia/ {print $2}')
 
     if [ -z "$NVIDIA_PACKAGES" ]; then
-        success "未检测到已安装的 NVIDIA 驱动包"
+        success "未检测到已安装的 NVIDIA 驱动包，无需卸载"
         return 0
     fi
 
@@ -883,6 +891,7 @@ remove_nvidia_driver() {
     fi
     apt_with_progress "清理无用依赖" autoremove --purge -y
     success "NVIDIA 驱动已全部卸载"
+    DRIVER_REMOVED=1
 
     # 恢复 Nouveau（删除黑名单，让开源驱动接管显示）
     if [ -f /etc/modprobe.d/blacklist-nouveau.conf ]; then
@@ -948,8 +957,18 @@ auto_remove_nvidia_and_mok() {
         echo ""
     fi
 
-    success "卸载完成"
-    ask_reboot
+    # 根据实际执行情况决定是否需要重启：
+    # - 卸载了驱动或提交了 MOK 删除请求 → 需要重启
+    # - 只清理了密钥文件/配置 → 无需重启
+    # - 什么都没检测到 → 直接结束
+    if [ "$DRIVER_REMOVED" -eq 1 ] || [ "$MOK_DELETE_PENDING" -eq 1 ]; then
+        success "卸载完成"
+        ask_reboot
+    elif [ "$MOK_CLEANED" -eq 1 ]; then
+        success "卸载完成，本次仅清理了本地文件，无需重启"
+    else
+        success "未检测到需要卸载的内容，未做任何更改，无需重启"
+    fi
     return 0
 }
 
