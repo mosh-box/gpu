@@ -4,7 +4,7 @@
 # GPU Manager
 # ============================================================
 
-VERSION="1.6.0"
+VERSION="1.6.1"
 LOG_FILE="/var/log/gpu-manager.log"
 APT_TIMEOUT=300
 DRIVER_TIMEOUT=600
