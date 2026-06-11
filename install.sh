@@ -2,7 +2,7 @@
 
 set -e
 
-VERSION="1.5.1"
+VERSION="1.6.0"
 INSTALL_PATH="/usr/local/bin/gpu-manager"
 REPO_URLS=(
     "https://raw.githubusercontent.com/mosh-box/gpu/main"
@@ -65,7 +65,5 @@ echo "Usage:"
 echo "  gpu-manager              进入交互式菜单"
 echo "  gpu-manager --help       查看帮助"
 echo "  gpu-manager --version    查看版本"
-echo "  gpu-manager --tpm-status 查看 TPM 状态"
-echo "  gpu-manager --update     自更新"
 echo ""
 
