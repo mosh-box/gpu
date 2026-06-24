@@ -1485,13 +1485,13 @@ do
     echo "  3. Remove Driver / MOK        卸载 NVIDIA 驱动 / MOK 密钥（可选范围）"
     echo ""
     echo " ── Secure Boot / MOK ────────────────────────────"
-    echo "  6. Enroll MOK & Reboot        注册 MOK 密钥并重启进入 MOK 界面"
+    echo "  4. Enroll MOK & Reboot        注册 MOK 密钥并重启进入 MOK 界面"
     echo ""
     echo " ── TPM 磁盘加密 ─────────────────────────────────"
-    echo "  4. Rebind TPM                 重新绑定 TPM"
+    echo "  5. Rebind TPM                 重新绑定 TPM"
     echo ""
     echo " ── 系统维护 ─────────────────────────────────────"
-    echo "  5. Uninstall GPU Manager      卸载本工具"
+    echo "  6. Uninstall GPU Manager      卸载本工具"
     echo "  0. Exit                       退出"
     echo ""
 
@@ -1515,16 +1515,16 @@ do
             ;;
 
         4)
-            tpm_rebind
-            pause
-            ;;
-
-        6)
             enroll_mok_and_reboot
             pause
             ;;
 
         5)
+            tpm_rebind
+            pause
+            ;;
+
+        6)
             warn "即将卸载 GPU Manager"
             confirm_action "是否继续"
             if [ $? -ne 0 ]; then
