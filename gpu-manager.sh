@@ -4,7 +4,7 @@
 # GPU Manager
 # ============================================================
 
-VERSION="1.6.2"
+VERSION="1.7.0"
 LOG_FILE="/var/log/gpu-manager.log"
 APT_TIMEOUT=300
 DRIVER_TIMEOUT=600
@@ -20,6 +20,7 @@ MOK_PASSWORD="enkey123"
 APT_FRESH=0
 MOK_ENROLL_PENDING=0
 MOK_DELETE_PENDING=0
+MOK_FAIL_REASON=""   # MOK 配置失败时由 setup_mok_key 写入“具体命中原因+处置”
 
 # 卸载流程实际执行情况（用于判断是否需要询问重启）
 DRIVER_REMOVED=0
@@ -345,6 +346,51 @@ setup_mok_key() {
     info "Secure Boot 已开启，自动配置 MOK 密钥签名驱动模块..."
     echo ""
 
+    # 失败时由本函数写入“具体命中的那一条原因 + 对应处置”，供上层精准提示
+    MOK_FAIL_REASON=""
+
+    # ── 自动处理(1)：缺 openssl / mokutil，能装就装，不提醒 ──────────
+    local _missing=""
+    command -v openssl &>/dev/null || _missing+=" openssl"
+    command -v mokutil &>/dev/null || _missing+=" mokutil"
+    if [ -n "$_missing" ]; then
+        info "缺少签名工具:$_missing，自动安装..."
+        apt_with_progress "安装 MOK 签名工具" install -y $_missing
+        if ! command -v openssl &>/dev/null || ! command -v mokutil &>/dev/null; then
+            MOK_FAIL_REASON=$(cat <<EOF
+[原因] 签名工具$_missing 缺失且自动安装失败（通常是软件源不可用 / 无网络）。
+[处置] 请手动执行后重试本工具：
+        sudo apt update && sudo apt install -y$_missing
+        详细日志: /tmp/gpu-manager-cmd-output.log
+EOF
+)
+            error "MOK 签名工具自动安装失败"
+            return 1
+        fi
+        success "签名工具已安装"
+    fi
+
+    # ── 自动检测(3)：efivars 只读 / 非真正 UEFI，无法写入 MOK，必须用户处理 ──
+    if [ ! -d /sys/firmware/efi ]; then
+        MOK_FAIL_REASON=$(cat <<'EOF'
+[原因] 当前为 Legacy/BIOS 启动（无 /sys/firmware/efi），根本不支持 MOK 注册。
+[处置] 这类机器本不该开 Secure Boot —— 进 BIOS 关闭 Secure Boot 后重跑本工具即可直接装驱动。
+EOF
+)
+        error "非 UEFI 启动，无法注册 MOK"
+        return 1
+    fi
+    if mount | grep -q 'efivars.*[(,]ro[,)]'; then
+        MOK_FAIL_REASON=$(cat <<'EOF'
+[原因] efivars 以只读(ro)挂载（常见于虚拟机/云主机），MOK 密钥写不进 UEFI。
+[处置] 这类机器通常无需 MOK —— 进 BIOS/控制台关闭 Secure Boot 后重跑本工具即可。
+        （如确为物理机，可尝试: sudo mount -o remount,rw /sys/firmware/efi/efivars 后重试）
+EOF
+)
+        error "efivars 只读，无法写入 MOK 密钥"
+        return 1
+    fi
+
     # 检查是否已有 MOK 密钥
     if [ -f "$MOK_PRIV" ] && [ -f "$MOK_DER" ]; then
         # 检查密钥是否已注册到 UEFI
@@ -363,6 +409,20 @@ setup_mok_key() {
             -subj "/CN=GPU Manager MOK Signing Key/" 2>/dev/null
 
         if [ $? -ne 0 ]; then
+            # 区分(2)：是否磁盘空间不足导致写不进去
+            local _avail
+            _avail=$(df -Pk /var 2>/dev/null | awk 'NR==2{print $4}')
+            if [ -n "$_avail" ] && [ "$_avail" -lt 10240 ]; then
+                MOK_FAIL_REASON=$(printf '%s\n%s\n        %s\n' \
+                    "[原因] /var 可用空间不足（剩余 $((_avail/1024)) MB），密钥文件写不进去。" \
+                    "[处置] 清理磁盘后重试本工具：" \
+                    "df -h /var   # 确认空间，清理后重跑")
+            else
+                MOK_FAIL_REASON=$(printf '%s\n%s\n        %s\n' \
+                    "[原因] openssl 生成密钥失败（非空间问题）。" \
+                    "[处置] 手动复现以查看具体报错：" \
+                    "sudo openssl req -new -x509 -newkey rsa:2048 -keyout $MOK_PRIV -outform DER -out $MOK_DER -nodes -days 36500 -subj '/CN=GPU Manager MOK Signing Key/'")
+            fi
             error "MOK 密钥生成失败"
             return 1
         fi
@@ -372,17 +432,78 @@ setup_mok_key() {
     # 自动注册，使用默认密码（重启时在 MOK Manager 界面输入同一密码）
     info "自动注册 MOK 密钥（默认密码: $MOK_PASSWORD）..."
     printf '%s\n%s\n' "$MOK_PASSWORD" "$MOK_PASSWORD" | mokutil --import "$MOK_DER" >/dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        success "MOK 密钥已提交注册请求（密码: $MOK_PASSWORD）"
+        MOK_ENROLL_PENDING=1
+        show_mok_enroll_guide
+        return 0
+    fi
 
+    # ── 自动处理(4)：可能是有未确认的待注册请求冲突，撤销后自动重试一次 ──
+    warn "首次注册失败，自动清理可能存在的待确认请求后重试..."
+    printf '%s\n%s\n' "$MOK_PASSWORD" "$MOK_PASSWORD" | mokutil --revoke-import >/dev/null 2>&1
+    printf '%s\n%s\n' "$MOK_PASSWORD" "$MOK_PASSWORD" | mokutil --import "$MOK_DER" >/dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        success "清理冲突后注册成功（密码: $MOK_PASSWORD）"
+        MOK_ENROLL_PENDING=1
+        show_mok_enroll_guide
+        return 0
+    fi
+
+    MOK_FAIL_REASON=$(printf '%s\n%s\n        %s\n' \
+        "[原因] mokutil --import 注册失败（已自动撤销待确认请求并重试仍失败）。" \
+        "[处置] 手动注册以查看 mokutil 的具体报错：" \
+        "sudo mokutil --import $MOK_DER")
+    error "MOK 密钥自动注册失败"
+    return 1
+}
+
+# 手动入口：注册 MOK 密钥并重启进入蓝色 MOK Manager 界面
+# （独立于装驱动流程，用户想单独触发“重启后弹出 MOK 注册界面”时使用）
+enroll_mok_and_reboot() {
+    echo ""
+    info "╔══════════════════════════════════════════════════════╗"
+    info "║   注册 MOK 密钥 → 重启进入 MOK Manager 注册界面        ║"
+    info "╚══════════════════════════════════════════════════════╝"
+    echo ""
+
+    # 前置检查：没有 UEFI / Secure Boot 未开启时，重启不会弹出 MOK 界面
+    if [ ! -d /sys/firmware/efi ]; then
+        error "当前为 Legacy/BIOS 启动，不支持 MOK，重启也不会出现 MOK 界面"
+        return 1
+    fi
+    if ! check_secure_boot; then
+        warn "Secure Boot 当前未开启：未签名模块本就能直接加载，无需 MOK。"
+        warn "若仍要预先注册密钥（为日后开启 Secure Boot 做准备），可继续。"
+        confirm_action "是否仍要注册 MOK 密钥并重启"
+        [ $? -ne 0 ] && return 1
+    fi
+
+    # 复用统一的密钥生成 + 注册逻辑（含自动装工具、清冲突重试、精准报错）
+    setup_mok_key
     if [ $? -ne 0 ]; then
-        error "MOK 密钥自动注册失败"
-        error "可手动执行: sudo mokutil --import $MOK_DER"
+        echo ""
+        error "MOK 密钥注册失败，无法进入 MOK 界面"
+        if [ -n "$MOK_FAIL_REASON" ]; then
+            echo ""
+            while IFS= read -r _line; do warn "  $_line"; done <<<"$MOK_FAIL_REASON"
+        fi
         return 1
     fi
 
-    success "MOK 密钥已提交注册请求（密码: $MOK_PASSWORD）"
-    MOK_ENROLL_PENDING=1
-    show_mok_enroll_guide
+    # setup_mok_key 成功有两种情况：
+    #   - 本次新提交了注册请求 → MOK_ENROLL_PENDING=1，重启即弹 MOK 界面
+    #   - 密钥早已注册 → 无待确认请求，重启不会再弹界面
+    if [ "$MOK_ENROLL_PENDING" -ne 1 ]; then
+        echo ""
+        success "MOK 密钥此前已注册，无需重复操作；重启不会再出现 MOK 界面。"
+        warn  "如需强制重新走一遍注册界面，可先在菜单 3 卸载 MOK 密钥后再用本功能。"
+        return 0
+    fi
 
+    echo ""
+    success "MOK 注册请求已提交，重启后即可看到蓝色 MOK Manager 界面。"
+    ask_reboot
     return 0
 }
 
@@ -577,7 +698,10 @@ install_nvidia_driver() {
     local NEED_MOK=0
 
     # ===== 自动检测是否需要 MOK 密钥 =====
-    if mok_enroll_needed || { [ -d /sys/firmware/efi ] && check_secure_boot; }; then
+    # 仅当“UEFI + Secure Boot 已开启”才需要 MOK：进入后由 setup_mok_key 决定
+    # 加不加密钥——未注册才生成并注册，已注册则跳过、只复用现有密钥签名模块。
+    # Secure Boot 关闭时走下面 elif 分支，完全不碰 MOK。
+    if [ -d /sys/firmware/efi ] && check_secure_boot; then
         echo ""
         info "╔══════════════════════════════════════════════════════╗"
         info "║  检测到 Secure Boot 已开启，需要 MOK 密钥签名驱动     ║"
@@ -586,13 +710,30 @@ install_nvidia_driver() {
 
         setup_mok_key
         if [ $? -ne 0 ]; then
-            warn "MOK 配置未完成，驱动仍会安装但不会签名"
-            warn "Secure Boot 开启状态下驱动将无法加载"
             echo ""
-            confirm_action "是否继续安装（不签名）"
-            if [ $? -ne 0 ]; then
-                return 1
+            error "============================================================"
+            error "  MOK key auto-config FAILED -- installation ABORTED"
+            error "============================================================"
+            echo ""
+            warn  "为什么中止：本机已开启 Secure Boot，驱动模块必须用 MOK 密钥"
+            warn  "签名后才能被内核加载。密钥没配好就装驱动，装完 nvidia-smi"
+            warn  "依然会失败（couldn't communicate with the NVIDIA driver），"
+            warn  "白白浪费 5-15 分钟编译时间，所以这里直接停下来。"
+            echo ""
+            # 只打印本次实际命中的那一条原因与处置（脚本已尽力自动修复，剩下的需用户处理）
+            if [ -n "$MOK_FAIL_REASON" ]; then
+                warn  "本次失败的具体原因与对应解决办法："
+                echo ""
+                while IFS= read -r _line; do warn "  $_line"; done <<<"$MOK_FAIL_REASON"
+            else
+                warn  "未能识别具体原因，详见日志: /tmp/gpu-manager-cmd-output.log"
             fi
+            echo ""
+            warn  "【最省事的替代方案】进 BIOS/UEFI 关闭 Secure Boot，"
+            warn  "关闭后无需 MOK，重新运行本工具即可直接安装。"
+            echo ""
+            error "解决上述问题后，请重新运行本工具。"
+            return 1
         else
             NEED_MOK=1
             # 提前配置 DKMS 自动签名，这样 ubuntu-drivers autoinstall
@@ -1343,6 +1484,9 @@ do
     echo "  2. Check GPU Status           检查 GPU 状态"
     echo "  3. Remove Driver / MOK        卸载 NVIDIA 驱动 / MOK 密钥（可选范围）"
     echo ""
+    echo " ── Secure Boot / MOK ────────────────────────────"
+    echo "  6. Enroll MOK & Reboot        注册 MOK 密钥并重启进入 MOK 界面"
+    echo ""
     echo " ── TPM 磁盘加密 ─────────────────────────────────"
     echo "  4. Rebind TPM                 重新绑定 TPM"
     echo ""
@@ -1372,6 +1516,11 @@ do
 
         4)
             tpm_rebind
+            pause
+            ;;
+
+        6)
+            enroll_mok_and_reboot
             pause
             ;;
 
