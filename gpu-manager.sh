@@ -974,16 +974,40 @@ auto_install_drivers() {
             apt_with_progress "清理依赖" autoremove -y
         fi
 
-        # 自动禁用 Nouveau（与 NVIDIA 官方驱动冲突）
-        if lsmod | grep -q nouveau; then
-            info "检测到 Nouveau 驱动，自动禁用..."
-            echo "blacklist nouveau" > /etc/modprobe.d/blacklist-nouveau.conf
-            echo "options nouveau modeset=0" >> /etc/modprobe.d/blacklist-nouveau.conf
+        # 自动禁用 Nouveau（开源/虚拟显卡驱动，与 NVIDIA 官方驱动冲突）
+        # 只要内核里加载了 nouveau、或黑名单文件尚未写入，都要处理一遍
+        if lsmod | grep -q "^nouveau" || [ ! -f /etc/modprobe.d/blacklist-nouveau.conf ]; then
+            info "检测到 Nouveau（开源显卡驱动），自动禁用..."
+
+            # 1) 写入完整黑名单，确保重启后不再加载
+            cat > /etc/modprobe.d/blacklist-nouveau.conf <<'EOF'
+blacklist nouveau
+blacklist lbm-nouveau
+options nouveau modeset=0
+alias nouveau off
+alias lbm-nouveau off
+EOF
+
+            # 2) 更新 initramfs，让黑名单在早期启动阶段生效
             run_with_timeout 180 "更新 initramfs" update-initramfs -u
-            if [ $? -eq 0 ]; then
-                success "Nouveau 已禁用"
+            if [ $? -ne 0 ]; then
+                warn "initramfs 更新出现问题，继续安装（重启后黑名单仍会生效）"
+            fi
+
+            # 3) 关键修复：当场卸载已加载的 nouveau，否则它会一直占用显卡到重启
+            if lsmod | grep -q "^nouveau"; then
+                info "正在卸载当前已加载的 Nouveau 模块..."
+                # 先停可能占用 nouveau 的显示管理器（无图形界面时忽略报错）
+                systemctl stop gdm gdm3 lightdm sddm 2>/dev/null
+                modprobe -r nouveau 2>/dev/null || rmmod nouveau 2>/dev/null
+                if lsmod | grep -q "^nouveau"; then
+                    warn "Nouveau 正在被占用，无法立即卸载，将在重启后彻底关闭"
+                    NOUVEAU_NEED_REBOOT=1
+                else
+                    success "Nouveau 已立即卸载并禁用"
+                fi
             else
-                warn "Nouveau 禁用过程出现问题，继续安装"
+                success "Nouveau 已禁用（重启后保持关闭）"
             fi
         fi
 
