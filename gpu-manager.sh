@@ -4,7 +4,7 @@
 # GPU Manager
 # ============================================================
 
-VERSION="1.7.0"
+VERSION="1.9.0"
 LOG_FILE="/var/log/gpu-manager.log"
 APT_TIMEOUT=300
 DRIVER_TIMEOUT=600
@@ -1376,6 +1376,670 @@ tpm_rebind() {
 }
 
 # ============================================================
+# RAID 存储管理
+# ============================================================
+
+# 输出承载 /、/boot、/boot/efi 的全部物理磁盘。
+# RAID 创建菜单会无条件保护这些磁盘，避免运行中的系统盘被误清空。
+get_system_backing_disks() {
+    local MOUNT_POINT SOURCE
+
+    for MOUNT_POINT in / /boot /boot/efi; do
+        SOURCE=$(findmnt -nro SOURCE --target "$MOUNT_POINT" 2>/dev/null | head -1)
+        [ -n "$SOURCE" ] || continue
+        SOURCE=${SOURCE%%\[*}
+        SOURCE=$(readlink -f "$SOURCE" 2>/dev/null || echo "$SOURCE")
+        [ -b "$SOURCE" ] || continue
+        lsblk -s -nrpo NAME,TYPE "$SOURCE" 2>/dev/null | awk '$2 == "disk" {print $1}'
+    done | sort -u
+}
+
+disk_is_system_backing() {
+    local TARGET_DISK="$1"
+    get_system_backing_disks | grep -Fxq "$TARGET_DISK"
+}
+
+disk_has_mounted_children() {
+    local TARGET_DISK="$1"
+    lsblk -nrpo MOUNTPOINT "$TARGET_DISK" 2>/dev/null | awk 'NF {found=1} END {exit !found}'
+}
+
+disk_has_active_storage_stack() {
+    local TARGET_DISK="$1"
+    local CHILD_TYPES
+
+    CHILD_TYPES=$(lsblk -nrpo TYPE "$TARGET_DISK" 2>/dev/null | tail -n +2)
+    echo "$CHILD_TYPES" | grep -Eq '^(crypt|lvm|raid[0-9]*|md)$'
+}
+
+disk_is_lvm_pv() {
+    local TARGET_DISK="$1"
+    local NODE PV
+
+    command -v pvs &>/dev/null || return 1
+    while read -r NODE; do
+        [ -n "$NODE" ] || continue
+        while read -r PV; do
+            PV=$(echo "$PV" | xargs)
+            [ -n "$PV" ] && [ "$NODE" = "$PV" ] && return 0
+        done < <(pvs --noheadings -o pv_name 2>/dev/null)
+    done < <(lsblk -nrpo NAME "$TARGET_DISK" 2>/dev/null)
+
+    return 1
+}
+
+disk_is_raid_candidate() {
+    local TARGET_DISK="$1"
+    local TYPE READ_ONLY REMOVABLE
+
+    read -r TYPE READ_ONLY REMOVABLE < <(lsblk -dnro TYPE,RO,RM "$TARGET_DISK" 2>/dev/null)
+    [ "$TYPE" = "disk" ] || return 1
+    [ "$READ_ONLY" = "0" ] || return 1
+    [ "$REMOVABLE" = "0" ] || return 1
+    disk_is_system_backing "$TARGET_DISK" && return 1
+    disk_has_mounted_children "$TARGET_DISK" && return 1
+    disk_has_active_storage_stack "$TARGET_DISK" && return 1
+    disk_is_lvm_pv "$TARGET_DISK" && return 1
+    return 0
+}
+
+list_raid_candidate_disks() {
+    local DISK TYPE READ_ONLY REMOVABLE
+
+    while read -r DISK TYPE READ_ONLY REMOVABLE; do
+        [ "$TYPE" = "disk" ] || continue
+        [ "$READ_ONLY" = "0" ] || continue
+        [ "$REMOVABLE" = "0" ] || continue
+        disk_is_raid_candidate "$DISK" && echo "$DISK"
+    done < <(lsblk -dnpo NAME,TYPE,RO,RM 2>/dev/null)
+}
+
+show_disk_identity() {
+    local TARGET_DISK="$1"
+    lsblk -dnpo NAME,SIZE,MODEL,SERIAL,WWN,TRAN "$TARGET_DISK" 2>/dev/null
+}
+
+show_disk_signatures() {
+    local TARGET_DISK="$1"
+    local NODE
+
+    while read -r NODE; do
+        [ -n "$NODE" ] || continue
+        wipefs --noheadings "$NODE" 2>/dev/null | sed "s|^|    $NODE: |" || true
+    done < <(lsblk -nrpo NAME "$TARGET_DISK" 2>/dev/null)
+}
+
+next_md_device() {
+    local INDEX DEVICE
+
+    for INDEX in $(seq 0 127); do
+        DEVICE="/dev/md${INDEX}"
+        if [ ! -e "$DEVICE" ] && ! grep -q "^md${INDEX}[[:space:]]" /proc/mdstat 2>/dev/null; then
+            echo "$DEVICE"
+            return 0
+        fi
+    done
+    return 1
+}
+
+validate_raid_name() {
+    local RAID_NAME="$1"
+    [[ "$RAID_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$ ]]
+}
+
+validate_raid_mountpoint() {
+    local MOUNT_POINT="$1"
+    [[ "$MOUNT_POINT" =~ ^/(data|mnt)/[A-Za-z0-9._/-]+$ ]] || return 1
+    [[ "$MOUNT_POINT" != *".."* ]] || return 1
+    [[ "$MOUNT_POINT" != *"//"* ]] || return 1
+    return 0
+}
+
+ensure_raid_tools() {
+    if command -v mdadm &>/dev/null; then
+        return 0
+    fi
+
+    warn "未安装 mdadm，创建 RAID 前需要安装"
+    fix_dpkg_state || return 1
+    check_network || return 1
+
+    if [ "$APT_FRESH" -ne 1 ]; then
+        apt_with_progress "更新软件源索引" update -qq || return 1
+        APT_FRESH=1
+    fi
+    apt_with_progress "安装 mdadm" install -y mdadm || return 1
+    command -v mdadm &>/dev/null
+}
+
+persist_md_array() {
+    local MD_DEVICE="$1"
+    local MD_UUID ARRAY_LINE MDADM_CONF="/etc/mdadm/mdadm.conf"
+
+    MD_UUID=$(mdadm --detail "$MD_DEVICE" 2>/dev/null | awk -F ': ' '/UUID/ {print $2; exit}')
+    [ -n "$MD_UUID" ] || {
+        error "无法读取阵列 UUID，未写入 mdadm.conf"
+        return 1
+    }
+
+    mkdir -p /etc/mdadm
+    touch "$MDADM_CONF"
+    if ! grep -Fq "$MD_UUID" "$MDADM_CONF"; then
+        ARRAY_LINE=$(mdadm --detail --scan 2>/dev/null | grep -F "$MD_UUID" | head -1)
+        [ -n "$ARRAY_LINE" ] || {
+            error "无法生成 ARRAY 配置行"
+            return 1
+        }
+        echo "$ARRAY_LINE" >> "$MDADM_CONF"
+    fi
+
+    if command -v update-initramfs &>/dev/null; then
+        run_with_timeout 180 "更新 initramfs" update-initramfs -u || {
+            warn "阵列已创建，但 initramfs 更新失败，请稍后手动执行: sudo update-initramfs -u"
+            return 1
+        }
+    fi
+    return 0
+}
+
+format_and_mount_raid() {
+    local MD_DEVICE="$1"
+    local RAID_NAME="$2"
+    local DEFAULT_MOUNT="/data/${RAID_NAME}"
+    local MOUNT_POINT FS_UUID LABEL FORMAT_CONFIRM
+
+    echo ""
+    read -p "是否立即格式化为 ext4 并自动挂载？(yes/no): " FORMAT_CONFIRM
+    [ "$FORMAT_CONFIRM" = "yes" ] || {
+        warn "已保留未格式化阵列: $MD_DEVICE"
+        return 0
+    }
+
+    read -p "挂载目录 [${DEFAULT_MOUNT}]: " MOUNT_POINT
+    MOUNT_POINT=${MOUNT_POINT:-$DEFAULT_MOUNT}
+    if ! validate_raid_mountpoint "$MOUNT_POINT"; then
+        error "挂载目录仅允许位于 /data/ 或 /mnt/ 下，且不能包含 .. 或重复斜杠"
+        return 1
+    fi
+    if mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
+        error "$MOUNT_POINT 已经是挂载点"
+        return 1
+    fi
+    if [ -d "$MOUNT_POINT" ] && [ -n "$(ls -A "$MOUNT_POINT" 2>/dev/null)" ]; then
+        error "$MOUNT_POINT 不是空目录，拒绝覆盖"
+        return 1
+    fi
+
+    LABEL=$(echo "$RAID_NAME" | tr '[:lower:]' '[:upper:]' | tr -cd 'A-Z0-9_-' | cut -c1-16)
+    [ -n "$LABEL" ] || LABEL="DATA_RAID"
+
+    info "正在格式化 $MD_DEVICE 为 ext4..."
+    mkfs.ext4 -F -L "$LABEL" "$MD_DEVICE" || return 1
+    mkdir -p "$MOUNT_POINT"
+
+    FS_UUID=$(blkid -s UUID -o value "$MD_DEVICE" 2>/dev/null)
+    if [ -z "$FS_UUID" ]; then
+        error "格式化完成但无法读取文件系统 UUID"
+        return 1
+    fi
+
+    if ! grep -Fq "UUID=$FS_UUID" /etc/fstab; then
+        {
+            echo ""
+            echo "# GPU Manager RAID: $RAID_NAME"
+            echo "UUID=$FS_UUID $MOUNT_POINT ext4 defaults,nofail,x-systemd.device-timeout=30 0 2"
+        } >> /etc/fstab
+    fi
+
+    mount "$MOUNT_POINT" || {
+        error "自动挂载失败，请检查 /etc/fstab"
+        return 1
+    }
+    success "阵列已格式化并挂载到 $MOUNT_POINT"
+    df -hT "$MOUNT_POINT"
+}
+
+raid_min_devices() {
+    case "$1" in
+        0|1) echo 2 ;;
+        5) echo 3 ;;
+        6|10) echo 4 ;;
+        *) return 1 ;;
+    esac
+}
+
+raid_device_count_valid() {
+    local RAID_LEVEL="$1"
+    local DEVICE_COUNT="$2"
+
+    case "$RAID_LEVEL" in
+        0|1) [ "$DEVICE_COUNT" -ge 2 ] ;;
+        5) [ "$DEVICE_COUNT" -ge 3 ] ;;
+        6) [ "$DEVICE_COUNT" -ge 4 ] ;;
+        10) [ "$DEVICE_COUNT" -ge 4 ] && [ $((DEVICE_COUNT % 2)) -eq 0 ] ;;
+        *) return 1 ;;
+    esac
+}
+
+show_raid_level_summary() {
+    case "$1" in
+        0) echo "RAID0  容量≈全部磁盘之和；无容错；至少 2 块" ;;
+        1) echo "RAID1  容量≈最小单盘；N 块镜像最多可坏 N-1 块；至少 2 块" ;;
+        5) echo "RAID5  容量≈(N-1)×最小盘；可坏 1 块；至少 3 块" ;;
+        6) echo "RAID6  容量≈(N-2)×最小盘；可坏 2 块；至少 4 块" ;;
+        10) echo "RAID10 容量≈总容量一半；镜像+条带；至少 4 块且必须为偶数" ;;
+    esac
+}
+
+extract_md_progress_percent() {
+    sed -n 's/.*=[[:space:]]*\([0-9][0-9.]*\)%.*/\1/p' | head -1
+}
+
+render_progress_bar() {
+    local PERCENT="$1"
+    local WIDTH="${2:-40}"
+    local FILLED EMPTY BAR_FILLED BAR_EMPTY
+
+    FILLED=$(awk -v p="$PERCENT" -v w="$WIDTH" 'BEGIN {n=int((p*w/100)+0.5); if(n<0)n=0; if(n>w)n=w; print n}')
+    EMPTY=$((WIDTH - FILLED))
+    printf -v BAR_FILLED '%*s' "$FILLED" ''
+    printf -v BAR_EMPTY '%*s' "$EMPTY" ''
+    BAR_FILLED=${BAR_FILLED// /#}
+    BAR_EMPTY=${BAR_EMPTY// /-}
+    printf '[%s%s]' "$BAR_FILLED" "$BAR_EMPTY"
+}
+
+list_active_md_arrays() {
+    awk '/^md[0-9]+[[:space:]]*:/ {print "/dev/" $1}' /proc/mdstat 2>/dev/null
+}
+
+monitor_md_progress() {
+    local MD_DEVICE="$1"
+    local MD_NAME STATUS_BLOCK PROGRESS_LINE PERCENT ACTION ETA SPEED MEMBERS STATE BAR KEY
+
+    MD_NAME=$(basename "$MD_DEVICE")
+    while true; do
+        STATUS_BLOCK=$(grep -A3 "^${MD_NAME}[[:space:]]*:" /proc/mdstat 2>/dev/null)
+        if [ -z "$STATUS_BLOCK" ]; then
+            error "阵列 $MD_DEVICE 不在 /proc/mdstat 中"
+            return 1
+        fi
+
+        PROGRESS_LINE=$(echo "$STATUS_BLOCK" | grep -E '(resync|recovery|reshape|check|repair)[[:space:]]*=' | head -1)
+        MEMBERS=$(echo "$STATUS_BLOCK" | grep -oE '\[[U_]+\]' | tail -1)
+        STATE=$(mdadm --detail "$MD_DEVICE" 2>/dev/null | awk -F ': ' '/State :/ {print $2; exit}')
+
+        printf '\033[H\033[2J'
+        echo "=================================================="
+        echo "          RAID 同步/恢复实时进度"
+        echo "=================================================="
+        echo "阵列: $MD_DEVICE"
+        echo "状态: ${STATE:-未知}"
+        echo "成员: ${MEMBERS:-未知}   （U=正常，_=缺失/异常）"
+        echo ""
+
+        if [ -z "$PROGRESS_LINE" ]; then
+            if echo "$MEMBERS" | grep -q '_'; then
+                warn "当前没有同步任务，但阵列存在缺失或异常成员。"
+            else
+                success "当前没有同步任务，阵列已完成或处于稳定状态。"
+            fi
+            echo ""
+            echo "$STATUS_BLOCK"
+            return 0
+        fi
+
+        PERCENT=$(echo "$PROGRESS_LINE" | extract_md_progress_percent)
+        ACTION=$(echo "$PROGRESS_LINE" | grep -oE '(resync|recovery|reshape|check|repair)' | head -1)
+        ETA=$(echo "$PROGRESS_LINE" | sed -n 's/.*finish=\([^[:space:]]*\).*/\1/p')
+        SPEED=$(echo "$PROGRESS_LINE" | sed -n 's/.*speed=\([^[:space:]]*\).*/\1/p')
+        PERCENT=${PERCENT:-0}
+        BAR=$(render_progress_bar "$PERCENT" 44)
+
+        echo "动作: ${ACTION:-同步}"
+        echo "$BAR  ${PERCENT}%"
+        echo "速度: ${SPEED:-计算中}"
+        echo "预计剩余: ${ETA:-计算中}"
+        echo ""
+        echo "$STATUS_BLOCK"
+        echo ""
+        echo "按 q 返回菜单；后台同步不会停止。"
+
+        KEY=""
+        read -rsn1 -t 1 KEY || true
+        [ "$KEY" = "q" ] && return 0
+    done
+}
+
+monitor_raid_progress_menu() {
+    local ARRAYS=()
+    local MD_DEVICE INDEX ARRAY_CHOICE
+
+    ensure_raid_tools || {
+        error "mdadm 准备失败"
+        return 1
+    }
+
+    while read -r MD_DEVICE; do
+        [ -n "$MD_DEVICE" ] && ARRAYS+=("$MD_DEVICE")
+    done < <(list_active_md_arrays)
+
+    if [ ${#ARRAYS[@]} -eq 0 ]; then
+        warn "当前没有活动的 MD RAID 阵列"
+        return 1
+    fi
+
+    echo ""
+    echo "请选择要监控的阵列："
+    for INDEX in "${!ARRAYS[@]}"; do
+        printf "  %d. %s\n" "$((INDEX + 1))" "${ARRAYS[$INDEX]}"
+    done
+    echo "  0. 取消"
+    read -p "请选择: " ARRAY_CHOICE
+    [ "$ARRAY_CHOICE" = "0" ] && return 0
+    if ! [[ "$ARRAY_CHOICE" =~ ^[0-9]+$ ]] || [ "$ARRAY_CHOICE" -lt 1 ] || [ "$ARRAY_CHOICE" -gt ${#ARRAYS[@]} ]; then
+        error "无效阵列序号"
+        return 1
+    fi
+
+    monitor_md_progress "${ARRAYS[$((ARRAY_CHOICE - 1))]}"
+}
+
+create_data_raid() {
+    local RAID_LEVEL="$1"
+    local RAID_LABEL="RAID${RAID_LEVEL}"
+    local CANDIDATES=() SELECTED_INDEXES=() SELECTED_DISKS=()
+    local INDEX SELECTED_INDEX DISK EXISTING_DISK NODE
+    local MIN_DEVICES DEVICE_COUNT SIZE SMALLEST_SIZE=0 BIGGEST_SIZE=0 DIFF_PERCENT
+    local RAID_NAME MD_DEVICE CONFIRM_PHRASE INPUT_NAME FINAL_CONFIRM PROTECTED_DISKS
+    local MONITOR_CONFIRM MDADM_ARGS=()
+
+    MIN_DEVICES=$(raid_min_devices "$RAID_LEVEL") || {
+        error "不支持的 RAID 级别: $RAID_LEVEL"
+        return 1
+    }
+
+    echo ""
+    warn "本功能只创建数据盘 ${RAID_LABEL}，不会迁移当前系统盘。"
+    warn "所有被选中的磁盘都会被完整清空，无法恢复。"
+    show_raid_level_summary "$RAID_LEVEL"
+    echo ""
+
+    PROTECTED_DISKS=$(get_system_backing_disks)
+    if [ -z "$PROTECTED_DISKS" ]; then
+        error "无法可靠识别当前系统承载磁盘，为避免误清系统盘，已拒绝创建 RAID。"
+        return 1
+    fi
+
+    while read -r DISK; do
+        [ -n "$DISK" ] && CANDIDATES+=("$DISK")
+    done < <(list_raid_candidate_disks)
+
+    if [ ${#CANDIDATES[@]} -lt "$MIN_DEVICES" ]; then
+        error "可安全选择的未挂载非系统磁盘不足 ${MIN_DEVICES} 块"
+        warn "已挂载磁盘、系统盘、活动 RAID/LVM/加密成员和可移动设备都会被排除。"
+        return 1
+    fi
+
+    echo "可选数据盘："
+    for INDEX in "${!CANDIDATES[@]}"; do
+        printf "  %d. " "$((INDEX + 1))"
+        show_disk_identity "${CANDIDATES[$INDEX]}"
+    done
+    echo ""
+    read -r -p "请输入磁盘序号，用空格分隔（输入 q 取消）: " -a SELECTED_INDEXES
+    [ ${#SELECTED_INDEXES[@]} -eq 1 ] && [ "${SELECTED_INDEXES[0]}" = "q" ] && return 1
+
+    for SELECTED_INDEX in "${SELECTED_INDEXES[@]}"; do
+        if ! [[ "$SELECTED_INDEX" =~ ^[0-9]+$ ]] || [ "$SELECTED_INDEX" -lt 1 ] || [ "$SELECTED_INDEX" -gt ${#CANDIDATES[@]} ]; then
+            error "存在无效磁盘序号: $SELECTED_INDEX"
+            return 1
+        fi
+        DISK="${CANDIDATES[$((SELECTED_INDEX - 1))]}"
+        for EXISTING_DISK in "${SELECTED_DISKS[@]}"; do
+            [ "$DISK" = "$EXISTING_DISK" ] && {
+                error "磁盘序号重复: $SELECTED_INDEX"
+                return 1
+            }
+        done
+        SELECTED_DISKS+=("$DISK")
+    done
+
+    DEVICE_COUNT=${#SELECTED_DISKS[@]}
+    if ! raid_device_count_valid "$RAID_LEVEL" "$DEVICE_COUNT"; then
+        error "${RAID_LABEL} 不支持当前磁盘数量: ${DEVICE_COUNT}"
+        show_raid_level_summary "$RAID_LEVEL"
+        return 1
+    fi
+
+    # 在任何破坏性操作前重新执行实时保护检查，防止选择后设备状态变化。
+    for DISK in "${SELECTED_DISKS[@]}"; do
+        disk_is_raid_candidate "$DISK" || {
+            error "$DISK 状态已变化，不再允许操作"
+            return 1
+        }
+        SIZE=$(lsblk -dnbo SIZE "$DISK")
+        [ -n "$SIZE" ] && [ "$SIZE" -gt 0 ] || {
+            error "无法读取 $DISK 的容量"
+            return 1
+        }
+        if [ "$SMALLEST_SIZE" -eq 0 ] || [ "$SIZE" -lt "$SMALLEST_SIZE" ]; then
+            SMALLEST_SIZE=$SIZE
+        fi
+        if [ "$SIZE" -gt "$BIGGEST_SIZE" ]; then
+            BIGGEST_SIZE=$SIZE
+        fi
+    done
+
+    DIFF_PERCENT=$(( (BIGGEST_SIZE - SMALLEST_SIZE) * 100 / BIGGEST_SIZE ))
+    if [ "$DIFF_PERCENT" -gt 1 ]; then
+        warn "所选磁盘容量最大相差 ${DIFF_PERCENT}%，可用容量或性能会受最小磁盘限制。"
+    fi
+
+    RAID_NAME="data-raid${RAID_LEVEL}"
+    read -p "阵列名称 [${RAID_NAME}]: " INPUT_NAME
+    RAID_NAME=${INPUT_NAME:-$RAID_NAME}
+    if ! validate_raid_name "$RAID_NAME"; then
+        error "名称必须以字母或数字开头，只能包含字母、数字、点、下划线和横杠，最长 32 字符"
+        return 1
+    fi
+
+    echo ""
+    warn "即将永久清空以下 ${DEVICE_COUNT} 块磁盘："
+    for DISK in "${SELECTED_DISKS[@]}"; do
+        show_disk_identity "$DISK"
+        show_disk_signatures "$DISK"
+    done
+    echo ""
+    confirm_action "确认所有所选磁盘都不是系统盘且数据已备份"
+    [ $? -eq 0 ] || return 1
+
+    CONFIRM_PHRASE="ERASE ${RAID_LABEL}"
+    read -p "最后确认：请输入 ${CONFIRM_PHRASE}: " FINAL_CONFIRM
+    if [ "$FINAL_CONFIRM" != "$CONFIRM_PHRASE" ]; then
+        warn "确认短语不匹配，操作已取消"
+        return 1
+    fi
+
+    ensure_raid_tools || {
+        error "mdadm 准备失败"
+        return 1
+    }
+
+    MD_DEVICE=$(next_md_device) || {
+        error "没有可用的 /dev/mdN 设备编号"
+        return 1
+    }
+
+    info "清理旧文件系统和 RAID 签名..."
+    for DISK in "${SELECTED_DISKS[@]}"; do
+        while read -r NODE; do
+            [ -n "$NODE" ] || continue
+            mdadm --zero-superblock --force "$NODE" >/dev/null 2>&1 || true
+            wipefs --all --force "$NODE" || return 1
+        done < <(lsblk -nrpo NAME "$DISK" 2>/dev/null | tac)
+        blockdev --rereadpt "$DISK" 2>/dev/null || true
+    done
+    udevadm settle 2>/dev/null || true
+
+    info "创建 ${RAID_LABEL}: $MD_DEVICE"
+    MDADM_ARGS=(
+        --create "$MD_DEVICE"
+        --metadata=1.2
+        --name="$RAID_NAME"
+        --level="$RAID_LEVEL"
+        --raid-devices="$DEVICE_COUNT"
+        --force
+    )
+    [ "$RAID_LEVEL" = "10" ] && MDADM_ARGS+=(--layout=n2)
+    mdadm "${MDADM_ARGS[@]}" "${SELECTED_DISKS[@]}" || {
+        error "RAID 创建失败"
+        return 1
+    }
+    udevadm settle 2>/dev/null || true
+
+    persist_md_array "$MD_DEVICE" || warn "阵列可用，但持久化配置需要人工复核"
+    success "${RAID_LABEL} 已创建: $MD_DEVICE"
+    mdadm --detail "$MD_DEVICE" || true
+    echo ""
+    cat /proc/mdstat
+
+    format_and_mount_raid "$MD_DEVICE" "$RAID_NAME" || warn "阵列已创建，但格式化/挂载未完成"
+
+    if [ "$RAID_LEVEL" != "0" ]; then
+        echo ""
+        read -p "是否立即查看实时同步进度？(yes/no) [yes]: " MONITOR_CONFIRM
+        MONITOR_CONFIRM=${MONITOR_CONFIRM:-yes}
+        [ "$MONITOR_CONFIRM" = "yes" ] && monitor_md_progress "$MD_DEVICE"
+    else
+        success "RAID0 无镜像/校验同步阶段，可直接使用。"
+    fi
+}
+
+create_raid_wizard() {
+    local LEVEL_CHOICE
+
+    echo ""
+    echo "请选择 RAID 级别："
+    echo "  1. RAID0  高容量/高吞吐，无容错"
+    echo "  2. RAID1  镜像冗余"
+    echo "  3. RAID5  单校验，可坏 1 块"
+    echo "  4. RAID6  双校验，可坏 2 块"
+    echo "  5. RAID10 镜像+条带"
+    echo "  0. 取消"
+    read -p "请选择: " LEVEL_CHOICE
+
+    case "$LEVEL_CHOICE" in
+        1) create_data_raid 0 ;;
+        2) create_data_raid 1 ;;
+        3) create_data_raid 5 ;;
+        4) create_data_raid 6 ;;
+        5) create_data_raid 10 ;;
+        0) return 0 ;;
+        *) error "无效 RAID 级别"; return 1 ;;
+    esac
+}
+
+show_raid_storage_status() {
+    echo ""
+    info "磁盘、挂载与 RAID 状态"
+    echo ""
+    lsblk -o NAME,SIZE,MODEL,SERIAL,FSTYPE,TYPE,MOUNTPOINTS
+    echo ""
+    info "受保护的系统承载磁盘（RAID 创建菜单不可选择）："
+    get_system_backing_disks | while read -r DISK; do
+        [ -n "$DISK" ] && show_disk_identity "$DISK"
+    done
+    echo ""
+    info "/proc/mdstat:"
+    cat /proc/mdstat 2>/dev/null || true
+    if command -v mdadm &>/dev/null; then
+        echo ""
+        mdadm --detail --scan 2>/dev/null || true
+    fi
+}
+
+generate_system_raid1_audit() {
+    local REPORT="/var/log/gpu-manager-raid-audit-$(date +%Y%m%d-%H%M%S).log"
+
+    {
+        echo "===== GPU Manager RAID1 Migration Audit ====="
+        date --iso-8601=seconds 2>/dev/null || date
+        uname -a
+        echo ""
+        lsblk -b -e7 -o NAME,PATH,SIZE,MODEL,SERIAL,WWN,FSTYPE,FSVER,TYPE,MOUNTPOINTS
+        echo ""
+        findmnt /
+        findmnt /boot 2>/dev/null || true
+        findmnt /boot/efi 2>/dev/null || true
+        echo ""
+        pvs --segments -o+devices 2>/dev/null || true
+        vgs 2>/dev/null || true
+        lvs -a -o+devices,segtype,copy_percent 2>/dev/null || true
+        echo ""
+        dmsetup ls --tree 2>/dev/null || true
+        echo ""
+        cat /proc/mdstat 2>/dev/null || true
+        echo ""
+        cat /etc/crypttab 2>/dev/null || true
+        echo ""
+        cat /etc/fstab 2>/dev/null || true
+        echo ""
+        efibootmgr -v 2>/dev/null || true
+    } 2>&1 | tee "$REPORT"
+
+    echo ""
+    success "只读检测报告已保存: $REPORT"
+}
+
+show_system_raid1_guide() {
+    local AUDIT_CONFIRM
+    echo ""
+    warn "系统盘 RAID1 迁移不能在当前运行系统中当作普通数据 RAID 一键创建。"
+    echo ""
+    echo "安全迁移必须分阶段完成："
+    echo "  1) 识别当前根分区、LVM/LUKS、/boot 和 EFI"
+    echo "  2) 在空闲盘创建降级 RAID1并复制系统"
+    echo "  3) 安装第二块盘的 GRUB/EFI并切换启动"
+    echo "  4) 成功从新阵列启动后，才清理原系统盘"
+    echo "  5) 将原系统盘加入 RAID1，等待同步并做单盘启动测试"
+    echo ""
+    warn "本工具不会在未验证新启动链路前清空当前系统盘。"
+    echo ""
+    read -p "是否生成系统 RAID1迁移只读检测报告？(yes/no): " AUDIT_CONFIRM
+    [ "$AUDIT_CONFIRM" = "yes" ] && generate_system_raid1_audit
+}
+
+raid_management_menu() {
+    local RAID_CHOICE
+
+    while true; do
+        clear
+        echo -e "\e[36m"
+        echo "=================================================="
+        echo "                 RAID 存储管理"
+        echo "=================================================="
+        echo -e "\e[0m"
+        echo "  1. 查看磁盘与 RAID 状态"
+        echo "  2. 创建数据盘 RAID0/1/5/6/10（清空所选磁盘）"
+        echo "  3. 查看同步/恢复实时进度"
+        echo "  4. 系统盘 RAID1迁移指引/检测（只读）"
+        echo "  0. 返回主菜单"
+        echo ""
+        read -p "请选择功能: " RAID_CHOICE
+
+        case "$RAID_CHOICE" in
+            1) show_raid_storage_status; pause ;;
+            2) create_raid_wizard; pause ;;
+            3) monitor_raid_progress_menu; pause ;;
+            4) show_system_raid1_guide; pause ;;
+            0) return 0 ;;
+            *) error "无效选项"; pause ;;
+        esac
+    done
+}
+
+# ============================================================
 # 状态摘要
 # ============================================================
 
@@ -1439,6 +2103,8 @@ show_help() {
     echo "  --tpm-rebind DEV    非交互式 TPM 重新绑定（需手动输入恢复密钥）"
     echo ""
     echo "无参数运行进入交互式菜单。"
+    echo "RAID 菜单可创建未挂载数据盘 RAID0/1/5/6/10，并实时显示同步/恢复进度。"
+    echo "当前系统盘始终受保护；系统 RAID1只提供迁移指引和检测。"
     echo "注意：必须使用 sudo 运行。"
     echo ""
     echo "日志文件: $LOG_FILE"
@@ -1448,12 +2114,13 @@ show_help() {
 # 命令行参数处理（非交互模式）
 # ============================================================
 
-if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
+main() {
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     show_help
     exit 0
 fi
 
-if [ "$1" = "--version" ] || [ "$1" = "-v" ]; then
+if [ "${1:-}" = "--version" ] || [ "${1:-}" = "-v" ]; then
     echo "GPU Manager v$VERSION"
     exit 0
 fi
@@ -1461,8 +2128,8 @@ fi
 # 以下命令需要 root
 check_root
 
-if [ "$1" = "--tpm-rebind" ]; then
-    if [ -z "$2" ]; then
+if [ "${1:-}" = "--tpm-rebind" ]; then
+    if [ -z "${2:-}" ]; then
         error "用法: sudo gpu-manager --tpm-rebind /dev/nvmeXnXpX"
         exit 1
     fi
@@ -1514,8 +2181,11 @@ do
     echo " ── TPM 磁盘加密 ─────────────────────────────────"
     echo "  5. Rebind TPM                 重新绑定 TPM"
     echo ""
+    echo " ── RAID 存储管理 ─────────────────────────────────"
+    echo "  6. RAID Management            RAID0/1/5/6/10、同步监控与系统盘指引"
+    echo ""
     echo " ── 系统维护 ─────────────────────────────────────"
-    echo "  6. Uninstall GPU Manager      卸载本工具"
+    echo "  7. Uninstall GPU Manager      卸载本工具"
     echo "  0. Exit                       退出"
     echo ""
 
@@ -1549,6 +2219,10 @@ do
             ;;
 
         6)
+            raid_management_menu
+            ;;
+
+        7)
             warn "即将卸载 GPU Manager"
             confirm_action "是否继续"
             if [ $? -ne 0 ]; then
@@ -1581,3 +2255,8 @@ do
     esac
 
 done
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
